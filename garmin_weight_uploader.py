@@ -1,45 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Garmin Weight Uploader (Plan A: GitHub Actions-friendly)
-- CSV를 리포에 커밋해 두고 이를 읽어 가민 커넥트에 체중을 업로드합니다.
-- '날짜' + '시간'을 합쳐 (KST) 타임스탬프 생성 → UTC로 변환 후 업로드.
-- 필수: 몸무게(kg), 날짜, 시간
-- 선택: 체지방률(%) (없어도 됨)
-
-로컬 실행:
-    pip install -r requirements.txt
-    export GARMIN_EMAIL="your@email"
-    export GARMIN_PASSWORD="your_password"
-    python garmin_weight_uploader.py
-
-GitHub Actions:
-    - 리포 시크릿에 GARMIN_EMAIL / GARMIN_PASSWORD 등록
-    - .github/workflows/garmin-weight.yml 로 스케줄 실행
+Garmin Weight Uploader (Google Drive → GitHub Actions)
+- 실행 시 작업 디렉토리에 있는 "무게 *.csv" 중 가장 최신 파일을 자동 선택
+- '날짜' + '시간'을 KST로 합쳐 UTC 타임스탬프 생성 후 업로드
+- 필수 컬럼: 날짜, 시간, 몸무게
+- 선택 컬럼: 체지방률 (없어도 됨)
 
 환경변수:
-    DRY_RUN=1  → 업로드 대신 미리보기만 출력
+  GARMIN_EMAIL / GARMIN_PASSWORD : 가민 계정
+  DRY_RUN=1  → 업로드 대신 미리보기만 출력
 """
 
 import os
 import sys
+import glob
 import pandas as pd
 from datetime import timezone, timedelta
 from dateutil import parser as dateparser
+from pathlib import Path
 
-# ===== CSV 파일명 (리포 루트에 커밋) =========================================
-CSV_FILE = "무게 2025.09.18 Google Fit.csv"
-
-# ===== 컬럼명 매핑 (CSV에 존재하는 정확한 이름으로 설정) ======================
+# ===== 컬럼명 (CSV에 존재하는 정확한 이름으로 맞춤) ==========================
 DATE_COL   = "날짜"     # 예: 2025-09-18
-TIME_COL   = "시간"     # 예: 21:03:00  (비어있으면 날짜만으로 처리)
-WEIGHT_COL = "몸무게"   # kg (필수)
-FAT_COL    = "체지방률"  # % (선택, 없으면 자동 무시)
+TIME_COL   = "시간"     # 예: 21:03:00 (비어있으면 날짜만으로 처리)
+WEIGHT_COL = "몸무게"   # kg
+FAT_COL    = "체지방률"  # % (선택)
 
 # ===== 타임존: KST(UTC+9) ===================================================
 LOCAL_TZ = timezone(timedelta(hours=9))  # Asia/Seoul
 
 def to_float(val):
-    """문자열/퍼센트 포함 값들을 float으로 안전 변환"""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     try:
@@ -51,20 +40,16 @@ def to_float(val):
         return None
 
 def parse_ts(date_val, time_val):
-    """DATE_COL + TIME_COL 결합하여 KST 기준 → UTC 변환"""
     if pd.isna(date_val) or str(date_val).strip() == "":
         return None
-    if time_val is None or (isinstance(time_val, float) and pd.isna(time_val)) or str(time_val).strip() == "":
-        ts_text = str(date_val)
-    else:
-        ts_text = f"{date_val} {time_val}"
+    ts_text = str(date_val) if not time_val or (isinstance(time_val, float) and pd.isna(time_val)) or str(time_val).strip()=="" \
+              else f"{date_val} {time_val}"
     dt = dateparser.parse(ts_text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=LOCAL_TZ)
     return dt.astimezone(timezone.utc)
 
 def read_csv_safely(path):
-    """UTF-8-SIG → UTF-8 → CP949 순서로 시도"""
     last_err = None
     for enc in ("utf-8-sig", "utf-8", "cp949"):
         try:
@@ -74,12 +59,23 @@ def read_csv_safely(path):
     print("[ERROR] CSV 읽기 실패. 마지막 에러:", last_err)
     sys.exit(1)
 
+def pick_latest_csv():
+    # 리포 workspace(현재 작업 디렉토리)에서 "무게 *.csv" 목록 중 최신 파일 선택
+    candidates = sorted(Path(".").glob("무게 *.csv"))
+    if not candidates:
+        print("[ERROR] 작업 디렉토리에 '무게 *.csv' 파일이 없습니다. 드라이브 다운로드 스텝을 확인하세요.")
+        sys.exit(1)
+    # 수정시각 기준 최신
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    print(f"[INFO] 선택된 CSV: {latest}")
+    return str(latest)
+
 def ensure_deps():
     for dep in ("garminconnect", "pytz", "dateutil", "pandas"):
         try:
             __import__(dep)
         except ImportError:
-            print(f"[ERROR] {dep} 미설치. 다음으로 설치하세요: pip install -r requirements.txt")
+            print(f"[ERROR] {dep} 미설치. pip install -r requirements.txt 로 설치하세요.")
             sys.exit(1)
 
 def main():
@@ -89,11 +85,13 @@ def main():
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
     if not email or not password:
-        print("[WARN] GARMIN_EMAIL / GARMIN_PASSWORD 미설정. 최초 로그인 시 프롬프트가 뜰 수 있습니다(토큰 캐시됨).")
+        print("[WARN] GARMIN_EMAIL / GARMIN_PASSWORD 미설정. 최초 로그인 시 프롬프트가 뜰 수 있음(토큰 캐시됨).")
 
     dry_run = os.getenv("DRY_RUN", "0") == "1"
 
-    df = read_csv_safely(CSV_FILE)
+    csv_file = pick_latest_csv()
+    df = read_csv_safely(csv_file)
+
     # 필수 컬럼 체크
     for col in (DATE_COL, WEIGHT_COL):
         if col not in df.columns:
@@ -101,20 +99,18 @@ def main():
             sys.exit(1)
     # TIME_COL은 없어도 동작 가능
 
-    # 가민 로그인 (토큰은 ~/.garminconnect에 캐시)
     g = Garmin(email, password)
-    g.login()
+    g.login()  # 토큰은 ~/.garminconnect 에 캐시
 
     success = 0
     failed = 0
 
     for idx, row in df.iterrows():
-        date_val = row.get(DATE_COL, None)
-        time_val = row.get(TIME_COL, None) if TIME_COL in df.columns else None
-
+        date_val = row.get(DATE_COL)
+        time_val = row.get(TIME_COL) if TIME_COL in df.columns else None
         ts_utc = parse_ts(date_val, time_val)
-        weight_kg = to_float(row.get(WEIGHT_COL, None))
-        percent_fat = to_float(row.get(FAT_COL, None)) if (FAT_COL and FAT_COL in df.columns) else None
+        weight_kg = to_float(row.get(WEIGHT_COL))
+        percent_fat = to_float(row.get(FAT_COL)) if (FAT_COL and FAT_COL in df.columns) else None
 
         if ts_utc is None or weight_kg is None:
             print(f"[SKIP] Row {idx}: timestamp/weight 누락. date={date_val}, time={time_val}, weight={row.get(WEIGHT_COL)}")
@@ -127,7 +123,6 @@ def main():
             continue
 
         try:
-            # 타임스탬프 지정 업로드가 가능한 버전이면 우선 사용
             if hasattr(g, "add_weigh_in_with_timestamps"):
                 g.add_weigh_in_with_timestamps(
                     weight_kg=weight_kg,
@@ -136,7 +131,6 @@ def main():
                     timestamp=ts_utc.isoformat(timespec="milliseconds")
                 )
             else:
-                # 구버전 fallback: timestamp가 무시될 수 있음
                 g.add_weigh_in(weight_kg=weight_kg, percent_fat=percent_fat, bmi=None)
             print(f"[OK] Row {idx}: {ts_utc.isoformat()} UTC, weight={weight_kg}, fat={percent_fat}")
             success += 1
