@@ -1,19 +1,17 @@
-name: Garmin weight upload (Drive → Garmin)
+name: Garmin weight upload
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    - cron: "30 21 * * *"   # KST 06:30
+    - cron: "30 21 * * *"   # KST 06:30 (UTC 21:30)
 
 jobs:
-  upload:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -23,8 +21,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install rclone
-        run: |
-          curl -fsSL https://rclone.org/install.sh | sudo bash
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Write service account JSON
         shell: bash
@@ -45,44 +42,18 @@ jobs:
           root_folder_id = ${FOLDER_ID}
           EOF
 
-      - name: DEBUG - List files (name,size,modtime)
+      - name: Download CSVs from Drive
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
-          rclone lsl gdrive: || true
-
-      - name: Download all (export Sheets→CSV)
-        env:
-          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
-        run: |
-          set -e
           rclone copy gdrive: . --drive-export-formats csv --progress
-          echo "Workspace files:"
-          ls -al
-          echo "CSV files present:"
-          ls -al *.csv || true
-          echo "===== SHOW FIRST 5 LINES OF LATEST CSV ====="
-          ls -t *.csv | head -n 1 | xargs -I{} sh -c 'echo ">>> {}"; head -n 5 "{}"'
+          echo "Workspace files:" && ls -al
+          echo "CSV files:" && ls -al *.csv || true
 
-      - name: Restore Garmin token cache (~/.garminconnect)
-        id: restore_token
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.garminconnect
-          key: garmin-token-v1
-
-      # ⬇️ 진단을 위해 DRY_RUN=1 로 1회 실행 (업로드 대신 파싱/타임스탬프만 출력)
-      - name: Upload to Garmin (diagnostic dry run)
+      - name: Upload to Garmin
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          DRY_RUN: "1"
+          # DRY_RUN: "1"   # ← 테스트 모드 원하면 주석 해제
         run: |
           python garmin_weight_uploader.py
-
-      - name: Save Garmin token cache (first run only)
-        if: steps.restore_token.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.garminconnect
-          key: garmin-token-v1
