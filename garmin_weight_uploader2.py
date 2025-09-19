@@ -1,164 +1,104 @@
-# --- add imports (상단) ---
-from pathlib import Path
-import pandas as pd
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+# --- 새 유틸 함수들 ----------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+import csv
+import os
+import re
 
-KST = ZoneInfo("Asia/Seoul")
+KOR_COLS = {
+    "date": "날짜",
+    "time": "시간",
+    "weight": "몸무게",
+}
 
-# 가민 조회/업로드 경로 (기존 파일에 이미 있다면 그대로 사용)
-WEIGHT_POST_PATH = "/connectapi/weight/weight"           # 기존과 동일
-WEIGHT_RANGE_GET_PATH = "/connectapi/weight/weight/dateRange"  # 일자 범위 조회
+ISO = "%Y-%m-%d"
 
-# --- helper: 구글핏 CSV 파싱 ---
-def parse_googlefit_weight_csv(csv_path: Path) -> pd.DataFrame:
+def _parse_csv_daily_avg(csv_path: str) -> dict[str, float]:
     """
-    csv 예시 헤더:
-    날짜,시간,몸무게,체지방률,...
-    2025.09.18 00:00:00,00:00:00,"70.79891",...
+    CSV에서 같은 '날짜'별로 몸무게 평균을 계산해 { 'YYYY-MM-DD': 평균(kg) } 반환.
     """
-    df = pd.read_csv(csv_path)
-    # 컬럼 명 매핑(한글/공백 포함 대비)
-    colmap = {
-        "날짜": "date_str",
-        "시간": "time_str",
-        "몸무게": "weight",
-        "kst": "kst",  # 혹시 kst라는 컬럼명이 따로 오는 경우 대비
-    }
-    for k, v in colmap.items():
-        if k in df.columns:
-            df.rename(columns={k: v}, inplace=True)
+    by_day = defaultdict(list)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        for row in rdr:
+            # 날짜 칸은 '2025.09.18 00:00:00' 형식 → 앞의 날짜만 사용
+            raw = row.get(KOR_COLS["date"]) or ""
+            m = re.match(r"(\d{4})\.(\d{2})\.(\d{2})", raw)
+            if not m:
+                continue
+            day = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
-    # KST 기준 timestamp 만들기
-    ts = []
-    for i, row in df.iterrows():
-        # 가장 신뢰도 높은 순서로 선택
-        if "kst" in df.columns and pd.notna(row.get("kst")):
-            # kst가 "YYYY.MM.DD HH:MM:SS" 또는 ISO 형태라고 가정
-            s = str(row["kst"]).replace(".", "-")
-            s = s.replace(" ", "T") if "T" not in s else s
+            w = (row.get(KOR_COLS["weight"]) or "").replace('"', "")
             try:
-                dt = datetime.fromisoformat(s)
-            except Exception:
-                dt = datetime.strptime(str(row["kst"]), "%Y.%m.%d %H:%M:%S")
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=KST)
-        else:
-            # "날짜"+"시간" 조합
-            date_str = str(row.get("date_str", "")).strip()
-            time_str = str(row.get("time_str", "00:00:00")).strip()
-            if date_str and "." in date_str:
-                # "YYYY.MM.DD HH:MM:SS" 형태로 합치기
-                if " " in date_str:
-                    # 이미 시간 포함된 경우
-                    base = date_str
-                else:
-                    base = f"{date_str} {time_str}"
-                dt = datetime.strptime(base, "%Y.%m.%d %H:%M:%S").replace(tzinfo=KST)
-            else:
-                # 날짜가 없으면 업로드 시각(now, KST)
-                dt = datetime.now(tz=KST)
+                kg = float(w)
+            except ValueError:
+                continue
+            if kg <= 0:
+                continue
 
-        ts.append(dt)
+            by_day[day].append(kg)
 
-    df["dt_kst"] = ts
-
-    # 몸무게 정규화 (문자열/따옴표 제거 → float)
-    df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
-    df = df.dropna(subset=["weight"])
-
-    # (timestamp, weight) 기준 중복 제거
-    df = df.drop_duplicates(subset=["dt_kst", "weight"]).sort_values("dt_kst")
-
-    # 가민에 보낼 필드 준비
-    df["date"] = df["dt_kst"].dt.strftime("%Y-%m-%d")
-    df["time"] = df["dt_kst"].dt.strftime("%H:%M:%S")
-    return df[["dt_kst", "date", "time", "weight"]]
+    # 평균 내기
+    daily_avg = {}
+    for day, vals in by_day.items():
+        daily_avg[day] = round(sum(vals) / len(vals), 2)
+    return daily_avg
 
 
-# --- helper: 가민에 이미 있는 날짜 수집 ---
-def fetch_existing_weight_dates(garth) -> set[str]:
+def _get_existing_dates(garth, start: str, end: str) -> set[str]:
     """
-    최근 2년 정도 범위를 한 번에 조회(필요 시 조정 가능).
-    응답에서 기록이 존재하는 날짜들을 set으로 반환.
+    지정 구간에 이미 가민에 저장된 체중 기록이 있는 날짜(YYYY-MM-DD) 집합을 반환.
+    가민 Connect 내부 API는 문서화가 약해서, 가장 호환성 높은 dateRange 엔드포인트를 사용.
     """
-    today = datetime.now(tz=KST).date()
-    start = today.replace(year=today.year - 2)
-    params = {
-        "startDate": start.isoformat(),
-        "endDate": today.isoformat(),
-    }
-    resp = garth.connectapi(WEIGHT_RANGE_GET_PATH, params=params, method="GET")
-    # 응답 형태 예시 가정:
-    # [{"date":"2025-09-18","weight":69.2,...}, {"date":"2025-09-19","weight":69.8,...}, ...]
+    path = f"weight-service/weight/dateRange?startDate={start}&endDate={end}"
+    data = garth.connectapi(path, None, method="GET") or []
+    # 응답 예시는 [{"date":"2025-09-18","weight":69.2, ...}, ...] 형태가 흔함
     existing = set()
-    if isinstance(resp, list):
-        for item in resp:
-            d = item.get("date")
-            if d:
-                existing.add(d)
+    for item in data:
+        d = item.get("date") or item.get("calendarDate")
+        if d:
+            existing.add(d[:10])
     return existing
 
 
-# --- helper: 업로드 (기존 로직 재사용) ---
-def upload_weight(garth, date_str: str, time_str: str, weight_kg: float):
+def _post_weight(garth, day: str, kg: float):
     """
-    가민 단건 업로드. 기존 파일에서 사용하던 payload/경로를 유지.
+    시간 없이 날짜/무게만 업로드 (표시는 00:00로 보임이 정상).
     """
     payload = {
-        "date": date_str,             # YYYY-MM-DD
-        "time": time_str,             # HH:MM:SS (local)
-        "weight": float(weight_kg),   # kg
+        "date": day,
+        "weight": kg,
         "unitKey": "kg",
-        "sourceType": "USER_ENTERED",
-        "timeZone": "Asia/Seoul",
     }
-    # 기존 코드와 동일하게 POST
-    garth.connectapi(WEIGHT_POST_PATH, method="POST", json=payload)
+    # 공식 앱과 동일 경로 (No Content면 None 반환)
+    return garth.connectapi("weight-service/user-weight", payload, method="POST")
 
 
-# --- main 업로드 흐름(핵심) ---
-def run_upload_all_csv(garth):
-    # 1) 가민에 이미 기록된 날짜 미리 조회 → 그 날짜는 건너뜀
-    existing_dates = fetch_existing_weight_dates(garth)
-
-    # 2) 작업 폴더의 모든 CSV 순회(구글 드라이브에서 rclone으로 받아온 파일들)
-    csv_paths = sorted(Path(".").glob("*.csv"))
-    if not csv_paths:
-        print("[INFO] CSV가 없습니다. 종료합니다.")
+# --- 메인 처리 흐름(평균 & 중복 방지) -----------------------------------------
+def run_upload(csv_path: str, garth):
+    daily_avg = _parse_csv_daily_avg(csv_path)
+    if not daily_avg:
+        print("[INFO] CSV에서 업로드 후보를 찾지 못했습니다.")
         return
 
-    total, skipped_dates, uploaded = 0, set(), 0
+    start = min(daily_avg.keys())	
+    end   = max(daily_avg.keys())
 
-    for csv_path in csv_paths:
-        df = parse_googlefit_weight_csv(csv_path)
-        if df.empty:
+    existing = _get_existing_dates(garth, start, end)
+    print("[INFO] 업로드 후보(평균):")
+    for d in sorted(daily_avg.keys()):
+        mark = "(이미 있음)" if d in existing else ""
+        print(f"  - {d}  {daily_avg[d]} kg {mark}")
+
+    uploaded = 0
+    skipped  = 0
+    for d in sorted(daily_avg.keys()):
+        if d in existing:
+            print(f"[SKIP] {d} 이미 등록되어 있어 건너뜁니다.")
+            skipped += 1
             continue
+        resp = _post_weight(garth, d, daily_avg[d])
+        print(f"[OK] {d} -> {daily_avg[d]} kg  resp: {resp!r}")
+        uploaded += 1
 
-        # 이 CSV에 포함된 날짜 집합
-        dates_in_csv = sorted(df["date"].unique())
-
-        # 날짜 단위 스킵 규칙
-        # → 이 CSV의 각 날짜가 existing_dates에 있으면 해당 날짜의 레코드 전부 스킵
-        for date_str in dates_in_csv:
-            if date_str in existing_dates:
-                skipped_dates.add(date_str)
-                continue
-
-            # 날짜별 레코드 업로드
-            rows = df[df["date"] == date_str]
-            for _, r in rows.iterrows():
-                # time이 비어있을 수 있는 경우 now(KST)로 대체
-                time_str = r.get("time") or datetime.now(tz=KST).strftime("%H:%M:%S")
-                weight = float(r["weight"])
-                upload_weight(garth, date_str, time_str, weight)
-                uploaded += 1
-            # 업로드가 성공했다면, 해당 날짜는 다시 업로드하지 않도록 메모
-            existing_dates.add(date_str)
-
-        total += len(df)
-
-    print(f"[INFO] 총 CSV 레코드: {total}")
-    if skipped_dates:
-        print(f"[INFO] 가민에 이미 존재해서 스킵된 날짜: {', '.join(sorted(skipped_dates))}")
-    print(f"[OK] 업로드 건수: {uploaded}")
+    print(f"[SUMMARY] 업로드 {uploaded}건, 스킵 {skipped}건")
