@@ -1,14 +1,15 @@
-name: Garmin weight upload
+name: Garmin weight upload (Drive → Garmin)
 
 on:
   workflow_dispatch: {}
   schedule:
-    # 매일 KST 06:30 실행 → UTC로 -9h = 전날 21:30
+    # 매일 KST 06:30 → UTC 기준 전날 21:30
     - cron: "30 21 * * *"
 
 jobs:
   upload:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,35 +19,70 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restore Garmin token cache (~/.garminconnect)
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.garminconnect
-          key: garmin-token-v1
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # (선택) Google Drive 등 외부 URL에서 CSV 내려받아 덮어쓰기
-      - name: Download CSV from URL (optional)
-        if: env.CSV_URL != ''
-        env:
-          CSV_URL: ${{ secrets.CSV_URL }}
+      - name: Install rclone
         run: |
-          curl -L "$CSV_URL" -o "무게 2025.09.18 Google Fit.csv" || echo "Skip CSV download"
+          curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Run uploader
+      - name: Write service account JSON
+        run: |
+          echo "${{ secrets.GDRIVE_SA_JSON }}" > sa.json
+
+      - name: Create rclone config for Drive (service account)
+        run: |
+          cat > rclone.conf << 'EOF'
+          [gdrive]
+          type = drive
+          scope = drive.readonly
+          service_account_file = sa.json
+          team_drive =
+          root_folder_id =
+          EOF
+
+      - name: Download latest CSV from Drive folder
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          # List files (path + modtime), filter CSV, sort by time, pick latest
+          rclone lsf "gdrive:{${FOLDER_ID}}" --files-only --format "pt" --recursive \
+            | grep -E '\.csv$' \
+            | sort -k2 \
+            | tail -n 1 \
+            | awk '{print $1}' > latest.txt
+
+          if [ ! -s latest.txt ]; then
+            echo "No CSV found in Drive folder."
+            exit 1
+          fi
+
+          LATEST_FILE=$(cat latest.txt)
+          echo "Latest CSV in Drive: $LATEST_FILE"
+          rclone copy "gdrive:{${FOLDER_ID}}/$LATEST_FILE" . --progress
+
+          echo "Downloaded:"
+          ls -al "무게 "*.csv || true
+
+      - name: Restore Garmin token cache (~/.garminconnect)
+        id: restore_token
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
+
+      - name: Upload to Garmin
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          # 필요 시 DRY_RUN=1로 미리 점검 가능
         run: |
           python garmin_weight_uploader.py
 
       - name: Save Garmin token cache (first run only)
-        if: steps.cache-hit.outputs.cache-hit != 'true'
+        if: steps.restore_token.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.garminconnect
