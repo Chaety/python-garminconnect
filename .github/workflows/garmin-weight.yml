@@ -22,13 +22,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # 로그인 잘 되던 최신 조합 사용 (버전 핀 X)
+          # 로그인 잘되던 최신 조합 사용(핀 없음)
           pip install --upgrade garminconnect garth
+          python - <<'PY'
+          from importlib.metadata import version, PackageNotFoundError
+          for p in ["garminconnect","garth","pandas","python-dateutil"]:
+              try:
+                  print(p, version(p))
+              except PackageNotFoundError:
+                  print(p, "not installed")
+          PY
 
       - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
 
-      - name: Write Google SA JSON
+      - name: Write Google Service Account JSON
         shell: bash
         run: |
           cat > sa.json <<'JSON'
@@ -46,21 +56,22 @@ jobs:
           service_account_file = ${PWD}/sa.json
           root_folder_id = ${FOLDER_ID}
           EOF
+          echo "Rclone config written"
 
       - name: DEBUG - list remote
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
-        run: rclone lsl gdrive: || true
+        run: |
+          rclone lsl gdrive: || true
 
       - name: Download CSVs from Drive (export Sheets→CSV)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -e
-          # 구글 스프레드시트면 CSV로 익스포트, 일반 파일이면 그대로
           rclone copy gdrive: . --drive-export-formats csv
-          echo "Workspace files:"; ls -al
-          echo "CSV files:"; ls -al *.csv || true
+          echo "Workspace files:" && ls -al
+          echo "CSV files:" && ls -al *.csv || true
           # 최신 CSV 미리보기
           (ls -t *.csv 2>/dev/null | head -n 1 | xargs -I{} sh -c 'echo ">>> {}"; head -n 5 "{}"') || true
 
@@ -75,8 +86,9 @@ jobs:
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          # DRY_RUN: "1"   # 테스트 모드 필요하면 주석 해제
-        run: python garmin_weight_uploader.py
+          # DRY_RUN: "1"   # 필요하면 테스트 모드로
+        run: |
+          python garmin_weight_uploader.py
 
       - name: Save Garmin token cache (first run only)
         if: steps.restore_token.outputs.cache-hit != 'true'
