@@ -1,176 +1,246 @@
-from __future__ import annotations
-from pathlib import Path
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import os, sys, traceback
-import pandas as pd
-from garth import Client as Garth  # OAuth 토큰/세션
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-KST = ZoneInfo("Asia/Seoul")
-WEIGHT_POST_PATH = "/connectapi/weight/weight"
-WEIGHT_RANGE_GET_PATH = "/connectapi/weight/weight/dateRange"
+"""
+garmin_weight_uploader.py
+- Google Fit CSV(무게 기록)에서 체중을 읽어 Garmin Connect에 업로드
+- garth 0.5.x 이상 대응: tokenstore 제거, load_token/save_token 사용
+- garminconnect 라이브러리 버전별 차이를 감안하여 여러 메서드명을 순차 시도
+- 실패 시 garth HTTP API 직접 호출 시도
+"""
 
-def log(msg: str): print(msg, flush=True)
+import csv
+import glob
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
 
-def _to_kst_dt(date_str: str|None, time_str: str|None) -> datetime|None:
-    if not date_str and not time_str: return None
-    # 포맷들 방어적으로 처리
-    ds = (date_str or "").strip()
-    ts = (time_str or "").strip()
-    # “YYYY.MM.DD HH:MM:SS” 가 날짜 컬럼에 통째로 들어오기도 함
-    if ds and (" " in ds and ":" in ds) and not ts:
-        try: return datetime.strptime(ds, "%Y.%m.%d %H:%M:%S").replace(tzinfo=KST)
-        except: pass
-    # 일반 케이스
-    if not ts: ts = "00:00:00"
-    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try: return datetime.strptime(f"{ds} {ts}", fmt).replace(tzinfo=KST)
-        except: pass
-    return None
+from garth import Garth
 
-def parse_googlefit_csv(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    # 컬럼 정규화(있는 것만)
-    rename = {"날짜":"date","시간":"time","몸무게":"weight","kst":"kst"}
-    for k,v in rename.items():
-        if k in df.columns: df.rename(columns={k:v}, inplace=True)
-    # 체중 숫자화
-    df["weight"] = pd.to_numeric(df.get("weight"), errors="coerce")
-    df = df.dropna(subset=["weight"]).copy()
+try:
+    from garminconnect import Garmin  # type: ignore
+except Exception:
+    Garmin = None  # 없는 경우도 있음
 
-    # 우선순위: kst → (날짜,시간) → 업로드시각(나중에 대체)
-    dts = []
-    for _, r in df.iterrows():
-        dt = None
-        if "kst" in df.columns and pd.notna(r.get("kst")):
-            s = str(r.get("kst")).strip()
-            # "YYYY.MM.DD HH:MM:SS" / ISO 유사 처리
-            try:
-                dt = datetime.strptime(s, "%Y.%m.%d %H:%M:%S").replace(tzinfo=KST)
-            except:
-                try:
-                    s2 = s.replace(".", "-")
-                    if "T" not in s2 and " " in s2: s2 = s2.replace(" ", "T")
-                    dt = datetime.fromisoformat(s2)
-                    if dt.tzinfo is None: dt = dt.replace(tzinfo=KST)
-                except: dt = None
-        if dt is None:
-            dt = _to_kst_dt(str(r.get("date") or ""), str(r.get("time") or ""))
-        dts.append(dt)
-    df["dt_kst"] = dts
 
-    # 동일 타임스탬프+체중 완전 중복 제거(같은 CSV 안)
-    df = df.drop_duplicates(subset=["dt_kst","weight"])
-    # 업로드 시각이 필요한 행은 표시(실제 업로드 때 NOW로 채움)
-    df["needs_now"] = df["dt_kst"].isna()
-    return df[["dt_kst","weight","needs_now"]].sort_values("dt_kst", na_position="last").reset_index(drop=True)
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def die(msg: str) -> None:
+    print(f"[FATAL] {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+@dataclass
+class WeightRecord:
+    dt: datetime
+    weight_kg: float
+
 
 def ensure_login() -> Garth:
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
     if not email or not password:
-        print("[FATAL] GARMIN_EMAIL/GARMIN_PASSWORD 누락", file=sys.stderr); sys.exit(1)
-    token_dir = Path.home()/".garminconnect"
-    token_dir.mkdir(parents=True, exist_ok=True)
-    garth = Garth(tokenstore=str(token_dir))
+        die("GARMIN_EMAIL / GARMIN_PASSWORD 환경변수가 필요합니다.")
+
+    g = Garth()
     try:
-        garth.refresh_oauth2_token()
+        g.load_token()
+        g.refresh_token()
         log("[INFO] 토큰 재사용 로그인 성공")
-    except:
+    except Exception:
         log("[INFO] 신규 로그인 시도")
-        garth.login(email=email, password=password)
-        log("[INFO] 로그인 성공")
-    return garth
+        g.login(email=email, password=password)
+        g.save_token()
+        log("[INFO] 로그인 & 토큰 저장 완료 (~/.garth/token.json)")
 
-def fetch_existing(garth: Garth, start: datetime, end: datetime) -> set[tuple[str,str,float]]:
-    """가민에 이미 있는 (date,time,weight) 셋. time이 없게 내려오는 경우가 있어
-    최소한 (date, weight)이 같으면 중복으로 간주."""
-    existing: set[tuple[str,str,float]] = set()
+    return g
+
+
+def find_latest_csv(patterns=("*Google Fit.csv", "무게 *.csv")) -> Optional[str]:
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(p))
+    if not files:
+        return None
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    return files[0]
+
+
+def parse_weight_from_csv(path: str) -> Optional[WeightRecord]:
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    if not rows or len(rows) < 2:
+        log(f"[WARN] CSV 데이터가 비어있습니다: {path}")
+        return None
+
+    header = rows[0]
+    data = rows[1]
+
+    def idx(colname_candidates):
+        for name in colname_candidates:
+            if name in header:
+                return header.index(name)
+        return -1
+
+    i_date = idx(["날짜", "Date", "date"])
+    i_time = idx(["시간", "Time", "time"])
+    i_weight = idx(["몸무게", "Body Weight", "Weight", "weight"])
+
+    if i_weight < 0:
+        log("[WARN] '몸무게/Weight' 열을 찾을 수 없습니다.")
+        return None
+
+    raw_weight = (data[i_weight] or "").replace('"', "").strip()
+    if not raw_weight:
+        log("[WARN] 몸무게 값이 비어있습니다.")
+        return None
+
     try:
-        params = {"startDate": start.date().isoformat(), "endDate": end.date().isoformat()}
-        data = garth.connectapi(WEIGHT_RANGE_GET_PATH, params=params, method="GET")
-        if isinstance(data, list):
-            for it in data:
-                d = str(it.get("date") or "")
-                t = str(it.get("time") or "")
-                w = float(it.get("weight")) if it.get("weight") is not None else None
-                if d and w is not None:
-                    # 가민 웹은 소수 0.1 단위 반올림되어 보이기도 → 0.01 단위로 라운드
-                    existing.add((d, t, round(w, 2)))
-        log(f"[INFO] 기존 기록 {len(existing)}건 조회")
-    except Exception as e:
-        log(f"[WARN] 기존 기록 조회 실패: {e} (중복체크 약화)")
-    return existing
+        weight_kg = float(raw_weight)
+    except Exception:
+        log(f"[WARN] 몸무게 수치 파싱 실패: {raw_weight}")
+        return None
 
-def post_weight(garth: Garth, date_str: str, time_str: str, w: float):
-    payload = {
-        "date": date_str,
-        "time": time_str,
-        "weight": float(w),
-        "unitKey": "kg",
-        "sourceType": "USER_ENTERED",
-        "timeZone": "Asia/Seoul",
-    }
-    return garth.connectapi(WEIGHT_POST_PATH, method="POST", json=payload)
-
-def run():
-    log("[START] weight uploader")
-    garth = ensure_login()
-
-    csvs = sorted(Path(".").glob("*.csv"))
-    if not csvs:
-        log("[INFO] CSV 없음"); return
-
-    # CSV 범위로 기존 데이터 가져오기
-    # (최소/최대 날짜 추정; dt가 없는 행도 있을 수 있어 30일 범위로 보수)
-    min_dt, max_dt = None, None
-    parsed_per_file = []
-    for p in csvs:
-        df = parse_googlefit_csv(p)
-        parsed_per_file.append((p, df))
-        dts = df["dt_kst"].dropna()
-        if not dts.empty:
-            mn, mx = dts.min(), dts.max()
-            min_dt = mn if (min_dt is None or mn < min_dt) else min_dt
-            max_dt = mx if (max_dt is None or mx > max_dt) else max_dt
-    if min_dt is None:
-        min_dt = datetime.now(tz=KST) - timedelta(days=30)
-    if max_dt is None:
-        max_dt = datetime.now(tz=KST)
-
-    existing = fetch_existing(garth, min_dt, max_dt)
-
-    uploaded = 0
-    for p, df in parsed_per_file:
-        log(f"[FILE] {p.name} — rows:{len(df)}")
-        for _, r in df.iterrows():
-            dt: datetime|None = r["dt_kst"]
-            w = round(float(r["weight"]), 2)
-
-            if dt is None:
-                # 시간 정보가 없으면 업로드 시각 사용(KST)
-                dt = datetime.now(tz=KST)
-
-            dstr = dt.strftime("%Y-%m-%d")
-            tstr = dt.strftime("%H:%M:%S")
-
-            # 가민에 이미 같은 (date,time,weight) 또는 (date,'',weight) 있으면 스킵
-            key_exact = (dstr, tstr, w)
-            key_date_only = (dstr, "", w)
-            if key_exact in existing or key_date_only in existing:
-                log(f"[SKIP] 이미 존재: {dstr} {tstr} {w}kg")
-                continue
-
+    if i_date >= 0 and i_time >= 0:
+        raw_date = (data[i_date] or "").replace('"', "").strip()
+        raw_time = (data[i_time] or "").replace('"', "").strip()
+        dt_str = raw_date
+        if len(raw_date) <= 10 and raw_time:
+            dt_str = f"{raw_date} {raw_time}"
+        fmts = [
+            "%Y.%m.%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y.%m.%d",
+            "%Y-%m-%d",
+        ]
+        parsed = None
+        for fmt in fmts:
             try:
-                post_weight(garth, dstr, tstr, w)
-                uploaded += 1
-                existing.add(key_exact)  # 즉시 중복 방지
-                log(f"[OK]   {dstr} {tstr} -> {w}kg")
-            except Exception as e:
-                log(f"[ERR]  {dstr} {tstr} -> {w}kg : {e}")
-                traceback.print_exc()
+                parsed = datetime.strptime(dt_str, fmt)
+                break
+            except Exception:
+                pass
+        dt = parsed or datetime.now()
+    else:
+        dt = datetime.now()
 
-    log(f"[DONE] 업로드 {uploaded}건 완료")
+    return WeightRecord(dt=dt, weight_kg=weight_kg)
+
+
+def try_upload_with_garminconnect(garth_cli: Garth, rec: WeightRecord) -> bool:
+    if Garmin is None:
+        return False
+
+    api = None
+    for kwargs in ({"garth": garth_cli}, {"client": garth_cli}, {}):
+        try:
+            api = Garmin(**kwargs)  # type: ignore
+            break
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+    if api is None:
+        email = os.environ.get("GARMIN_EMAIL")
+        password = os.environ.get("GARMIN_PASSWORD")
+        if not email or not password:
+            return False
+        try:
+            api = Garmin(email, password)  # type: ignore
+            api.login()  # type: ignore
+        except Exception as e:
+            log(f"[WARN] garminconnect 구버전 로그인 실패: {e}")
+            api = None
+
+    if api is None:
+        return False
+
+    candidates = [
+        ("set_bodyweight", {"weight": rec.weight_kg, "date": rec.dt.date()}),
+        ("set_weight", {"weight": rec.weight_kg, "date": rec.dt.date()}),
+        ("upload_weight", {"weight": rec.weight_kg, "date": rec.dt.date()}),
+    ]
+
+    for method_name, kwargs in candidates:
+        try:
+            m = getattr(api, method_name, None)
+            if callable(m):
+                m(**kwargs)  # type: ignore
+                log(f"[INFO] garminconnect.{method_name}() 업로드 성공: {rec.weight_kg} kg @ {rec.dt}")
+                return True
+        except Exception as e:
+            log(f"[WARN] {method_name} 실패: {e}")
+
+    return False
+
+
+def try_upload_with_garth_http(garth_cli: Garth, rec: WeightRecord) -> bool:
+    try:
+        payload = {
+            "value": rec.weight_kg,
+            "unit": "kg",
+            "sourceType": "MANUAL",
+            "timestamp": int(rec.dt.timestamp() * 1000),
+        }
+        r = garth_cli.connectjson(
+            method="POST",
+            url="https://connect.garmin.com/modern/proxy/weight-service/user-weight",
+            json=payload,
+        )
+        if r and (isinstance(r, dict) or isinstance(r, list)):
+            log("[INFO] garth HTTP 업로드 성공(POST user-weight)")
+            return True
+    except Exception as e:
+        log(f"[WARN] garth HTTP(POST) 실패: {e}")
+
+    try:
+        epoch_ms = int(rec.dt.timestamp() * 1000)
+        payload = {"value": rec.weight_kg, "unit": "kg", "sourceType": "MANUAL"}
+        r = garth_cli.connectjson(
+            method="PUT",
+            url=f"https://connect.garmin.com/modern/proxy/weight-service/user-weight/{epoch_ms}",
+            json=payload,
+        )
+        if r is None or isinstance(r, (dict, list)):
+            log("[INFO] garth HTTP 업로드 성공(PUT user-weight/{ts})")
+            return True
+    except Exception as e:
+        log(f"[WARN] garth HTTP(PUT) 실패: {e}")
+
+    return False
+
+
+def run() -> None:
+    log("[START] weight uploader")
+    garth_cli = ensure_login()
+
+    csv_path = find_latest_csv()
+    if not csv_path:
+        die("CSV 파일을 찾지 못했습니다.")
+
+    rec = parse_weight_from_csv(csv_path)
+    if not rec:
+        die(f"CSV 파싱 실패: {csv_path}")
+
+    log(f"[INFO] 업로드 대상: {rec.weight_kg} kg @ {rec.dt}")
+
+    uploaded = try_upload_with_garminconnect(garth_cli, rec)
+    if not uploaded:
+        log("[WARN] garminconnect 실패 → garth HTTP 시도")
+        uploaded = try_upload_with_garth_http(garth_cli, rec)
+
+    if not uploaded:
+        die("업로드 실패 (라이브러리/엔드포인트 변경 가능성)")
+
+    log("[DONE] 업로드 성공")
+
 
 if __name__ == "__main__":
     try:
@@ -178,6 +248,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        log(f"[FATAL] 예외: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+        print(f"[FATAL] 예외: {e}", file=sys.stderr, flush=True)
+        raise
