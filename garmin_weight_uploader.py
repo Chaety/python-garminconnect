@@ -1,31 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Garmin Weight Uploader (Google Drive → GitHub Actions)
-- 실행 시 작업 디렉토리에 있는 "무게 *.csv" 중 가장 최신 파일을 자동 선택
-- '날짜' + '시간'을 KST로 합쳐 UTC 타임스탬프 생성 후 업로드
-- 필수 컬럼: 날짜, 시간, 몸무게
-- 선택 컬럼: 체지방률 (없어도 됨)
-
-환경변수:
-  GARMIN_EMAIL / GARMIN_PASSWORD : 가민 계정
-  DRY_RUN=1  → 업로드 대신 미리보기만 출력
+Garmin Weight Uploader
+- 현재 작업 디렉토리의 *.csv 중 '가장 최신' 파일을 자동 선택
+- '날짜' + '시간'을 KST로 합쳐 UTC 타임스탬프 생성 후 가민 커넥트에 업로드
+- 필수 컬럼: 날짜, 몸무게
+- 선택 컬럼: 시간, 체지방률
 """
 
 import os
 import sys
-import glob
 import pandas as pd
 from datetime import timezone, timedelta
 from dateutil import parser as dateparser
 from pathlib import Path
 
-# ===== 컬럼명 (CSV에 존재하는 정확한 이름으로 맞춤) ==========================
-DATE_COL   = "날짜"     # 예: 2025-09-18
-TIME_COL   = "시간"     # 예: 21:03:00 (비어있으면 날짜만으로 처리)
-WEIGHT_COL = "몸무게"   # kg
-FAT_COL    = "체지방률"  # % (선택)
+# ===== CSV 컬럼명 =====
+DATE_COL   = "날짜"       # 예) 2025-09-18
+TIME_COL   = "시간"       # 예) 21:03:00 (없으면 날짜만 사용)
+WEIGHT_COL = "몸무게"     # kg
+FAT_COL    = "체지방률"    # % (선택)
 
-# ===== 타임존: KST(UTC+9) ===================================================
+# ===== 타임존: KST(UTC+9) =====
 LOCAL_TZ = timezone(timedelta(hours=9))  # Asia/Seoul
 
 def to_float(val):
@@ -42,14 +37,16 @@ def to_float(val):
 def parse_ts(date_val, time_val):
     if pd.isna(date_val) or str(date_val).strip() == "":
         return None
-    ts_text = str(date_val) if not time_val or (isinstance(time_val, float) and pd.isna(time_val)) or str(time_val).strip()=="" \
-              else f"{date_val} {time_val}"
+    if time_val is None or (isinstance(time_val, float) and pd.isna(time_val)) or str(time_val).strip() == "":
+        ts_text = str(date_val)
+    else:
+        ts_text = f"{date_val} {time_val}"
     dt = dateparser.parse(ts_text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=LOCAL_TZ)
     return dt.astimezone(timezone.utc)
 
-def read_csv_safely(path):
+def read_csv_safely(path: Path) -> pd.DataFrame:
     last_err = None
     for enc in ("utf-8-sig", "utf-8", "cp949"):
         try:
@@ -59,16 +56,14 @@ def read_csv_safely(path):
     print("[ERROR] CSV 읽기 실패. 마지막 에러:", last_err)
     sys.exit(1)
 
-def pick_latest_csv():
-    # 리포 workspace(현재 작업 디렉토리)에서 "무게 *.csv" 목록 중 최신 파일 선택
-    candidates = sorted(Path(".").glob("무게 *.csv"))
+def pick_latest_csv() -> Path:
+    candidates = sorted(Path(".").glob("*.csv"))
     if not candidates:
-        print("[ERROR] 작업 디렉토리에 '무게 *.csv' 파일이 없습니다. 드라이브 다운로드 스텝을 확인하세요.")
+        print("[ERROR] 작업 디렉토리에 *.csv 파일이 없습니다. 드라이브 다운로드 스텝을 확인하세요.")
         sys.exit(1)
-    # 수정시각 기준 최신
     latest = max(candidates, key=lambda p: p.stat().st_mtime)
     print(f"[INFO] 선택된 CSV: {latest}")
-    return str(latest)
+    return latest
 
 def ensure_deps():
     for dep in ("garminconnect", "pytz", "dateutil", "pandas"):
@@ -89,18 +84,17 @@ def main():
 
     dry_run = os.getenv("DRY_RUN", "0") == "1"
 
-    csv_file = pick_latest_csv()
-    df = read_csv_safely(csv_file)
+    csv_path = pick_latest_csv()
+    df = read_csv_safely(csv_path)
 
     # 필수 컬럼 체크
     for col in (DATE_COL, WEIGHT_COL):
         if col not in df.columns:
             print(f"[ERROR] 필수 컬럼 누락: {col} / CSV 보유 컬럼: {list(df.columns)}")
             sys.exit(1)
-    # TIME_COL은 없어도 동작 가능
 
     g = Garmin(email, password)
-    g.login()  # 토큰은 ~/.garminconnect 에 캐시
+    g.login()
 
     success = 0
     failed = 0
