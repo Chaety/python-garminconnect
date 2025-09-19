@@ -10,10 +10,11 @@ from typing import Optional, Tuple
 
 from garth import Client as GarthClient
 
-# Garmin Connect API
+# Garmin Connect API endpoint for weight entries
 WEIGHT_POST_PATH = "/userprofile-service/userprofile/weight"
 
 def load_csv_latest() -> pd.DataFrame:
+    """가장 최근 CSV를 읽어 DataFrame 반환"""
     csv_files = [f for f in os.listdir(".") if f.lower().endswith(".csv")]
     if not csv_files:
         print("[ERROR] CSV 파일이 없습니다.")
@@ -22,12 +23,13 @@ def load_csv_latest() -> pd.DataFrame:
     latest_csv = max(csv_files, key=os.path.getmtime)
     print(f"[INFO] Selected CSV: {latest_csv}")
 
-    # 인코딩/구분자 자동 추정 보완 (기본은 ,)
+    # 기본은 쉼표 구분/UTF-8 가정. 필요시 여기서 encoding이나 sep 조정 가능.
     df = pd.read_csv(latest_csv)
     print(f"[INFO] Columns: {list(df.columns)}")
     return df
 
 def get_env_cred() -> Tuple[str, str]:
+    """환경변수에서 Garmin 계정 정보 읽기"""
     email = os.environ.get("GARMIN_EMAIL") or ""
     password = os.environ.get("GARMIN_PASSWORD") or ""
     if not email or not password:
@@ -36,10 +38,10 @@ def get_env_cred() -> Tuple[str, str]:
     return email, password
 
 def login_garth(email: str, password: str) -> GarthClient:
+    """garth 클라이언트 로그인"""
     client = GarthClient()
-    # 이메일/비밀번호 로그인
     client.login(email, password)
-    # 토큰 확보 (필요 시, 최신 garth는 login에 포함되지만 안전하게 한 번 더 보장)
+    # 일부 버전은 authenticate가 내부에서 실행되므로 예외 무시하고 보조 호출
     try:
         client.authenticate()
     except Exception:
@@ -48,9 +50,11 @@ def login_garth(email: str, password: str) -> GarthClient:
     return client
 
 def parse_row(row) -> Optional[Tuple[datetime, float]]:
-    """CSV 한 줄에서 (UTC datetime, kg) 추출. 잘못된 값은 None 반환."""
-
-    # 컬럼명(한국어) 기준
+    """
+    CSV 한 줄에서 (UTC datetime, kg) 추출.
+    형식: 날짜(YYYY.MM.DD ...), 시간(HH:MM:SS), 몸무게
+    잘못된 값은 None 반환.
+    """
     date_raw = str(row.get("날짜", "")).strip()
     time_raw = str(row.get("시간", "")).strip()
     weight_raw = row.get("몸무게", None)
@@ -58,7 +62,7 @@ def parse_row(row) -> Optional[Tuple[datetime, float]]:
     if not date_raw or not time_raw:
         return None
 
-    # 몸무게 NaN/0 방지
+    # 몸무게 NaN/0/음수/비수치 방지
     try:
         w = float(weight_raw)
         if math.isnan(w) or w <= 0:
@@ -66,16 +70,17 @@ def parse_row(row) -> Optional[Tuple[datetime, float]]:
     except Exception:
         return None
 
-    # 날짜는 "YYYY.MM.DD ..." 형태가 들어올 수 있으므로 앞부분만 사용
+    # 날짜/시간 앞부분만 사용
     date_part = date_raw.split()[0]
-    # 시간은 HH:MM:SS 기대
     time_part = time_raw.split()[0]
 
-    # "YYYY.MM.DD HH:MM:SS" 파싱 → UTC
+    # UTC로 간주해 업로드 (원 데이터가 현지시라면 필요시 tz 변환 추가)
+    # 기본 포맷 시도: 2025.09.18 03:19:22
+    dt: Optional[datetime] = None
     try:
         dt = datetime.strptime(f"{date_part} {time_part}", "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except ValueError:
-        # 혹시 "YYYY-MM-DD" 같은 변형이 오면 한 번 더 시도
+        # 보조 포맷: 2025-09-18 03:19:22
         try:
             dt = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except Exception:
@@ -84,23 +89,22 @@ def parse_row(row) -> Optional[Tuple[datetime, float]]:
     return dt, w
 
 def post_weight(client: GarthClient, when_utc: datetime, kg: float) -> None:
-    """garth.connectapi 로 무게 업로드. 에러면 예외 발생."""
+    """garth.connectapi 로 무게 업로드. 실패 시 예외."""
     epoch_ms = int(when_utc.timestamp() * 1000)
 
     payload = {
-        # 일부 앱은 date/gmtTimestamp 둘 다 요구. 둘 다 채워 안정성 확보.
+        # 안정성을 위해 날짜 문자열과 GMT epoch(ms) 모두 포함
         "date": when_utc.strftime("%Y-%m-%d"),
         "gmtTimestamp": epoch_ms,
         "value": float(kg),
         "unitKey": "kg",
     }
 
-    # garth는 base 경로/헤더/쿠키를 알아서 붙여줌
-    # data=payload 로 보내면 JSON으로 직렬화되어 전송됩니다.
-    resp = client.connectapi(WEIGHT_POST_PATH, data=payload, method="POST")
+    # garth가 세션/헤더를 관리하므로 경로와 메서드/바디만 지정
+    # data= 대신 json= 사용 (서버가 JSON 기대)
+    resp = client.connectapi(WEIGHT_POST_PATH, json=payload, method="POST")
 
-    # resp 가 dict 또는 requests.Response 유사 객체일 수 있음. 실패 시 garth가 예외를 던지는 편이므로
-    # 여기서는 별도 상태 검사 없이 넘어가되, 방어적으로 최소 확인:
+    # 실패 시 garth가 예외를 던지는 편이지만, dict 응답 형식 방어적 확인
     if isinstance(resp, dict) and resp.get("message") == "error":
         raise RuntimeError(f"API error: {resp}")
 
@@ -110,12 +114,16 @@ def main():
     client = login_garth(email, password)
 
     success, failed = 0, 0
+
+    # 행 순회
     for _, row in df.iterrows():
         parsed = parse_row(row)
         if not parsed:
             continue
+
         dt_utc, kg = parsed
         epoch_ms = int(dt_utc.timestamp() * 1000)
+
         try:
             post_weight(client, dt_utc, kg)
             print(f"[INFO] [OK] {dt_utc.date()} {kg}kg @ {dt_utc.isoformat()} ({epoch_ms})")
@@ -124,4 +132,7 @@ def main():
             print(f"[INFO] [FAIL] {dt_utc.date()} {kg}kg @ {dt_utc.isoformat()} ({epoch_ms}) - {e}")
             failed += 1
 
-    print(f"[INFO] Done. s
+    print(f"[INFO] Done. success={success}, failed={failed}")
+
+if __name__ == "__main__":
+    main()
