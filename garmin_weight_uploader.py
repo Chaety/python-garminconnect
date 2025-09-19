@@ -2,17 +2,19 @@
 """
 Garmin Weight Uploader
 - 작업 디렉토리의 *.csv 중 가장 최신 파일 자동 선택
-- '날짜' + '시간' → UTC timestamp 생성 후 가민 커넥트에 업로드
+- '날짜' + '시간'을 KST로 파싱 → UTC ISO8601로 변환
+- 가민 커넥트에 무게만 업로드 (percent_fat, bmi 미사용)
 - 필수 컬럼: 날짜, 몸무게
 - 선택 컬럼: 시간
 """
 
 import os
 import sys
-import pandas as pd
-from datetime import timezone, timedelta
-from dateutil import parser as dateparser
 from pathlib import Path
+from datetime import timezone, timedelta
+
+import pandas as pd
+from dateutil import parser as dateparser
 
 # ===== CSV 컬럼명 =====
 DATE_COL   = "날짜"
@@ -34,19 +36,23 @@ def to_float(val):
 def parse_ts(date_val, time_val):
     if pd.isna(date_val) or str(date_val).strip() == "":
         return None
-    ts_text = str(date_val) if not time_val or str(time_val).strip() == "" else f"{date_val} {time_val}"
+    if time_val is None or (isinstance(time_val, float) and pd.isna(time_val)) or str(time_val).strip() == "":
+        ts_text = str(date_val)
+    else:
+        ts_text = f"{date_val} {time_val}"
     dt = dateparser.parse(ts_text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=LOCAL_TZ)
     return dt.astimezone(timezone.utc)
 
 def read_csv_safely(path: Path) -> pd.DataFrame:
+    last = None
     for enc in ("utf-8-sig", "utf-8", "cp949"):
         try:
             return pd.read_csv(path, encoding=enc)
-        except Exception:
-            continue
-    print("[ERROR] CSV 읽기 실패:", path)
+        except Exception as e:
+            last = e
+    print("[ERROR] CSV 읽기 실패:", path, "; last err:", last)
     sys.exit(1)
 
 def pick_latest_csv() -> Path:
@@ -89,10 +95,14 @@ def main():
     g = Garmin(email, password)
     g.login()
 
-    success, failed = 0, 0
+    success = 0
+    failed = 0
 
     for idx, row in df.iterrows():
-        ts_utc = parse_ts(row.get(DATE_COL), row.get(TIME_COL) if TIME_COL in df.columns else None)
+        ts_utc = parse_ts(
+            row.get(DATE_COL),
+            row.get(TIME_COL) if TIME_COL in df.columns else None
+        )
         weight = to_float(row.get(WEIGHT_COL))
 
         if ts_utc is None or weight is None:
@@ -101,12 +111,12 @@ def main():
             continue
 
         if dry_run:
-            print(f"[DRY] {idx}: {ts_utc.isoformat()}, {weight}")
+            print(f"[DRY] {idx}: {ts_utc.isoformat()}, weight={weight}")
             success += 1
             continue
 
         try:
-            # 가변 시그니처 대응: 가능한 경우 timestamp 포함, 아니면 weight만
+            # 가능한 경우 timestamp 포함, 안 되면 weight만 업로드
             if hasattr(g, "add_weigh_in_with_timestamps"):
                 try:
                     g.add_weigh_in_with_timestamps(
@@ -114,7 +124,6 @@ def main():
                         timestamp=ts_utc.isoformat(timespec="milliseconds")
                     )
                 except TypeError:
-                    # timestamp 키워드 미지원 버전
                     g.add_weigh_in(weight=weight)
             else:
                 g.add_weigh_in(weight=weight)
@@ -123,4 +132,10 @@ def main():
             success += 1
 
         except Exception as e:
-            print(f"[FAIL] {idx}: {e}
+            print(f"[FAIL] {idx}: {e}")
+            failed += 1
+
+    print(f"Done. success={success}, failed={failed}")
+
+if __name__ == "__main__":
+    main()
