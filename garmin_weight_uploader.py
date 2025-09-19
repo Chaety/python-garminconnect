@@ -186,3 +186,21 @@ def run() -> None:
 
     rec = parse_weight_from_csv(csv_path)
     if not rec:
+        die(f"CSV 파싱 실패: {csv_path}")
+
+    log(f"[INFO] 업로드 대상: {rec.weight_kg} kg @ {rec.dt.isoformat(sep=' ', timespec='seconds')}")
+
+    if not upload_weight_with_garth(rec):
+        die("업로드 실패 (엔드포인트/계정 정책 변경 가능성)")
+
+    log("[DONE] 업로드 성공")
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[FATAL] 예외: {e}", file=sys.stderr, flush=True)
+        raise
