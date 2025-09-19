@@ -58,20 +58,32 @@ jobs:
           service_account_file = sa.json
           EOF
 
+      # 🔎 폴더 안 파일 목록을 먼저 찍어보며 접근 확인 (디버그용)
+      - name: DEBUG - List files under folder root
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          echo "Using Drive folder id: ${FOLDER_ID}"
+          echo "Listing (name + modtime) recursively..."
+          rclone lsf "gdrive:/" \
+            --drive-root-folder-id "${FOLDER_ID}" \
+            --drive-shared-with-me \
+            --format "pt" --files-only --recursive || true
+
       - name: Download latest CSV from Drive folder
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           set -e
-
           echo "Using Drive folder id: ${FOLDER_ID}"
 
-          # 목록 가져오기: 폴더 ID를 루트로 지정하여 그 아래만 탐색
-          # format: p(path) t(modtime)
-          rclone lsf gdrive: \
+          # 최신 CSV (경로, 수정시각) 목록 → 최신 1개 선택
+          rclone lsf "gdrive:/" \
             --drive-root-folder-id "${FOLDER_ID}" \
-            --files-only --format "pt" --recursive \
+            --drive-shared-with-me \
+            --format "pt" --files-only --recursive \
             | grep -E '\.csv$' \
             | sort -k2 \
             | tail -n 1 \
@@ -83,11 +95,12 @@ jobs:
           fi
 
           LATEST_FILE=$(cat latest.txt)
-          echo "Latest CSV in Drive (relative to folder root): $LATEST_FILE"
+          echo "Latest CSV (relative to folder root): $LATEST_FILE"
 
-          # 선택된 파일 다운로드 (폴더 ID를 루트로 동일하게 지정)
+          # 선택된 파일 다운로드 (폴더 ID를 루트로 지정)
           rclone copy "gdrive:${LATEST_FILE}" . \
             --drive-root-folder-id "${FOLDER_ID}" \
+            --drive-shared-with-me \
             --progress
 
           echo "Downloaded files in workspace:"
