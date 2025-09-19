@@ -1,168 +1,354 @@
-# garmin_weight_uploader.py (전체 교체)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+garmin_weight_uploader.py
+
+- Google Drive / Google Fit에서 내려받은 한국어 CSV(예: "무게 2025.09.18 Google Fit.csv")를 읽어
+  가민 커넥트에 과거 시각 포함해 체중을 업로드합니다.
+- garth 세션의 connectapi()를 반드시 **호출**해서 requests.Session 을 받아 사용합니다.
+  (수정 포인트: sess = client.connectapi()  ← 기존의 함수 레퍼런스 사용으로 인한 AttributeError 수정)
+- CSV 파싱은 다음을 모두 허용합니다.
+  1) '날짜' 컬럼에 "YYYY.MM.DD HH:MM:SS"가 들어있는 형태
+  2) '날짜'는 날짜만, '시간'에 HH:MM:SS가 들어있는 형태
+  3) 따옴표가 있는 숫자 문자열("70.2") 등
+
+환경변수:
+- GARMIN_EMAIL
+- GARMIN_PASSWORD
+
+필수 패키지:
+- garth>=0.5
+- pandas, python-dateutil
+"""
+
 from __future__ import annotations
-import os, time, json
+
+import json
+import logging
+import os
+import time
 from dataclasses import dataclass
-from typing import Tuple
 from datetime import datetime
+from typing import Optional, Tuple
+
 import pandas as pd
 from dateutil import tz
-import requests
+
 import garth
 
-# ---- 설정 ----
+
+# -------------------------
+# 설정
+# -------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# 가민 커넥트 Weight 업로드 엔드포인트
+# (리포 내 기존 상수명 유지: WEIGHT_POST_URL)
+WEIGHT_POST_URL = (
+    "https://connect.garmin.com/modern/proxy/userprofile-service/userprofile/userprofile/weight"
+)
+
+# CSV에서 사용하는 한국어 컬럼명(일부 앱/내보내기 변형 대응)
 COL_DATE = "날짜"
 COL_TIME = "시간"
 COL_WEIGHT = "몸무게"
-CSV_GLOB = "*.csv"
-LOCAL_TZ = os.environ.get("LOCAL_TZ", "Asia/Seoul")
-WEIGHT_POST_URL = "https://connect.garmin.com/modern/proxy/weight-service/user-weight"
-MAX_RETRIES = 4
-BASE_SLEEP = 1.5
-# --------------
 
-@dataclass
-class UploadResult:
-    ok: bool
-    status: int
-    text: str
-    attempt: int
+# 기본 단위(kg)
+UNIT_KEY = "kg"
 
-def _read_latest_csv() -> Tuple[str, pd.DataFrame]:
-    import glob, os
-    files = sorted(glob.glob(CSV_GLOB), key=os.path.getmtime, reverse=True)
-    if not files:
-        raise FileNotFoundError("CSV (*.csv) 파일이 없습니다.")
-    csv = files[0]
-    df = pd.read_csv(csv)
-    return csv, df
+# 과거 시각 업로드 시 타임존: CSV가 현지(예: Asia/Seoul) 기준이라면 해당 타임존을 지정
+# 명시가 없다면 시스템 로컬을 사용하고, 실패 시 Asia/Seoul 로 폴백
+LOCAL_TZ_CANDIDATES = [
+    os.getenv("LOCAL_TZ", "").strip(),
+    tz.tzlocal(),
+    tz.gettz("Asia/Seoul"),
+]
 
-def _try_parse_dt(s: str, patterns: list[str]) -> datetime | None:
-    for p in patterns:
-        try:
-            return datetime.strptime(s, p)
-        except ValueError:
-            continue
-    return None
 
-def _parse_row_to_dt_kg(row) -> Tuple[datetime, float]:
-    """행에서 (현지 시각 datetime(타임존 포함), kg) 반환."""
-    date_s = str(row.get(COL_DATE, "")).strip()
-    time_s = str(row.get(COL_TIME, "")).strip()
-    w_s = str(row.get(COL_WEIGHT, "")).strip().replace('"', '').replace(',', '')
+# -------------------------
+# 로깅
+# -------------------------
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="[%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-    if not date_s:
-        raise ValueError("날짜 열이 비어있습니다.")
-    if not w_s:
-        raise ValueError("몸무게 열이 비어있습니다.")
 
-    # 1) 날짜열이 'YYYY.MM.DD HH:MM:SS' 또는 'YYYY-MM-DD HH:MM:SS' 인 경우
-    dt_local = _try_parse_dt(date_s,
-        ["%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"])
-    # 2) 날짜만 있는 경우, 시간열을 붙여서 파싱
+# -------------------------
+# 유틸
+# -------------------------
+def _first_valid_tz() -> tz.tzfile | tz.tzlocal:
+    for cand in LOCAL_TZ_CANDIDATES:
+        if cand:
+            return cand
+    # 최후 폴백
+    return tz.gettz("UTC")
+
+
+LOCAL_TZ = _first_valid_tz()
+
+
+def _read_latest_csv_in_cwd() -> str:
+    """현재 작업 폴더에서 가장 최근 CSV 하나 선택."""
+    csvs = sorted(
+        (p for p in os.listdir(".") if p.lower().endswith(".csv")),
+        key=lambda x: os.path.getmtime(x),
+        reverse=True,
+    )
+    if not csvs:
+        raise FileNotFoundError("작업 디렉터리에 CSV가 없습니다.")
+    latest = csvs[0]
+    logger.info("Selected CSV: %s", latest)
+    return latest
+
+
+def _to_float_safe(val) -> Optional[float]:
+    """따옴표 포함 문자열 등 다양한 입력을 float로 안전 변환."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip().replace(",", "")
+    if s == "" or s.lower() in {"nan", "none"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _parse_datetime_kr(date_cell: str, time_cell: Optional[str]) -> Tuple[datetime, str]:
+    """
+    한국어 CSV의 날짜/시간을 파싱하여 '현지 타임존 aware' datetime 생성 후,
+    UTC epoch millis(timestampGMT) 계산에 쓰기 위해 반환.
+
+    허용 예:
+    - date_cell: "2025.09.18 12:57:00", time_cell: "12:57:00"  (time_cell은 무시)
+    - date_cell: "2025.09.18",         time_cell: "12:57:00"
+    - date_cell: "2025-09-18",         time_cell: "12:57:00"
+    - date_cell: "2025/09/18 03:19:22", time_cell: None
+
+    반환: (dt_local_aware, date_str_yyyy_mm_dd)
+    """
+    date_cell = (str(date_cell) if date_cell is not None else "").strip()
+    time_cell = (str(time_cell) if time_cell is not None else "").strip()
+
+    # 1) 날짜 칸에 이미 시간까지 들어있는 경우 먼저 시도
+    #    포맷 후보들을 순차 시도
+    dt_str_candidates = []
+    # date_cell 자체가 datetime 포함
+    if any(sep in date_cell for sep in [":"]):
+        dt_str_candidates.append(date_cell)
+    # date + time 결합 (공백 구분)
+    if date_cell and time_cell and ":" in time_cell and ":" not in date_cell:
+        dt_str_candidates.append(f"{date_cell} {time_cell}")
+
+    # 포맷 후보
+    fmts = [
+        "%Y.%m.%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y.%m.%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+    ]
+
+    # 2) 시도
+    dt_local = None
+    for s in (c for c in dt_str_candidates if c):
+        for fmt in fmts:
+            try:
+                dt_naive = datetime.strptime(s, fmt)
+                dt_local = dt_naive.replace(tzinfo=LOCAL_TZ)
+                break
+            except ValueError:
+                continue
+        if dt_local:
+            break
+
+    # 3) 여전히 실패하면 날짜만/시간만 케이스를 다시 조합
     if dt_local is None:
-        # 시간열이 비었으면 00:00:00
-        if not time_s:
-            time_s = "00:00:00"
-        joined = f"{date_s} {time_s}".strip()
-        dt_local = _try_parse_dt(joined, [
-            "%Y.%m.%d %H:%M:%S",
-            "%Y-%m-%d %H:%M:%S",
-        ])
-    # 3) 마지막으로 날짜만이라도 파싱해서 00:00:00 부여
+        # 날짜 파싱
+        date_fmts = ["%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d"]
+        d_only = None
+        for fmt in date_fmts:
+            try:
+                d_only = datetime.strptime(date_cell, fmt)
+                break
+            except ValueError:
+                continue
+        # 시간 파싱
+        t_only = None
+        if time_cell:
+            time_fmts = ["%H:%M:%S", "%H:%M"]
+            for fmt in time_fmts:
+                try:
+                    t_only = datetime.strptime(time_cell, fmt)
+                    break
+                except ValueError:
+                    continue
+
+        if d_only is not None:
+            if t_only is not None:
+                dt_naive = datetime(
+                    d_only.year,
+                    d_only.month,
+                    d_only.day,
+                    t_only.hour,
+                    t_only.minute,
+                    t_only.second if hasattr(t_only, "second") else 0,
+                )
+            else:
+                dt_naive = datetime(d_only.year, d_only.month, d_only.day, 0, 0, 0)
+
+            dt_local = dt_naive.replace(tzinfo=LOCAL_TZ)
+
     if dt_local is None:
-        only_date = _try_parse_dt(date_s, ["%Y.%m.%d", "%Y-%m-%d"])
-        if only_date is not None:
-            dt_local = datetime(
-                only_date.year, only_date.month, only_date.day, 0, 0, 0
-            )
-    if dt_local is None:
-        raise ValueError(f"날짜/시간 파싱 실패: date='{date_s}', time='{time_s}'")
+        # 원본 문자열을 보존해 디버깅 용이
+        raise ValueError(f"날짜/시간 파싱 실패: date='{date_cell}', time='{time_cell}'")
 
-    # 타임존 부여
-    dt_local = dt_local.replace(tzinfo=tz.gettz(LOCAL_TZ))
+    date_str = dt_local.strftime("%Y-%m-%d")
+    return dt_local, date_str
 
-    # 몸무게 kg 파싱
-    if w_s.lower().endswith("kg"):
-        w_s = w_s[:-2]
-    kg = float(w_s.strip())
 
-    return dt_local, kg
+def _epoch_millis_utc(dt_local_aware: datetime) -> int:
+    """현지 aware datetime → UTC epoch millis."""
+    dt_utc = dt_local_aware.astimezone(tz.UTC)
+    return int(dt_utc.timestamp() * 1000)
 
-def _payloads_for(dt_local: datetime, kg: float) -> Tuple[dict, dict]:
-    dt_utc = dt_local.astimezone(tz.UTC)
-    payload1 = {
-        "timestampGMT": dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000"),
-        "weight": kg,
-        "unitKey": "kg",
-        "sourceType": "MANUAL",
-    }
-    payload2 = {
-        "date": dt_local.strftime("%Y-%m-%d"),
-        "time": dt_local.strftime("%H:%M:%S"),
-        "weight": kg,
-        "unitKey": "kg",
-        "sourceType": "MANUAL",
-    }
-    return payload1, payload2
 
-def _post_with_retries(sess: requests.Session, url: str, body: dict) -> UploadResult:
-    for attempt in range(1, MAX_RETRIES + 1):
+def _post_with_retries(sess, url: str, body: dict, retries: int = 3, backoff: float = 1.5):
+    """간단한 재시도 POST 래퍼."""
+    last_exc = None
+    for i in range(1, retries + 1):
         try:
             r = sess.post(url, json=body, timeout=30)
-            code = r.status_code
-            if code in (200, 201, 204):
-                return UploadResult(True, code, r.text, attempt)
-            if code in (409, 429) or 500 <= code < 600:
-                time.sleep(BASE_SLEEP * (2 ** (attempt - 1)))
-                continue
-            return UploadResult(False, code, r.text, attempt)
-        except requests.RequestException as e:
-            if attempt == MAX_RETRIES:
-                return UploadResult(False, -1, repr(e), attempt)
-            time.sleep(BASE_SLEEP * (2 ** (attempt - 1)))
-    return UploadResult(False, -1, "unknown", MAX_RETRIES)
+            if r.status_code // 100 == 2:
+                return r
+            logger.warning("POST 실패(status=%s) - %s", r.status_code, r.text[:200])
+        except Exception as e:
+            last_exc = e
+            logger.warning("POST 예외(%d/%d): %s", i, retries, e)
+        time.sleep(backoff * i)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("POST 재시도 초과")
 
-def main():
-    email = os.environ.get("GARMIN_EMAIL")
-    password = os.environ.get("GARMIN_PASSWORD")
+
+@dataclass
+class WeightRow:
+    dt_local: datetime
+    date_str: str
+    weight_kg: float
+
+
+def _row_from_series(row: pd.Series) -> Optional[WeightRow]:
+    """CSV 한 행 → WeightRow. 파싱 실패/무게 없음이면 None."""
+    try:
+        # 컬럼명 정규화: 공백 제거
+        s = {k.strip(): row[k] for k in row.index}
+
+        # 날짜/시간 파싱
+        dt_local, date_str = _parse_datetime_kr(s.get(COL_DATE), s.get(COL_TIME))
+
+        # 무게
+        weight = _to_float_safe(s.get(COL_WEIGHT))
+        if weight is None or weight <= 0:
+            return None
+
+        return WeightRow(dt_local=dt_local, date_str=date_str, weight_kg=weight)
+
+    except Exception as e:
+        logger.info("[SKIP] row %s: 파싱 실패 - %s", getattr(row, "name", "?"), e)
+        return None
+
+
+def _load_rows(csv_path: str) -> list[WeightRow]:
+    df = pd.read_csv(csv_path)
+    logger.info("Columns: %s", list(df.columns))
+    rows: list[WeightRow] = []
+    for _, r in df.iterrows():
+        wr = _row_from_series(r)
+        if wr:
+            rows.append(wr)
+    return rows
+
+
+def _build_payload(w: WeightRow) -> dict:
+    """
+    가민 커넥트 Weight 업로드 페이로드.
+    - timestampGMT: UTC epoch millis
+    - date: YYYY-MM-DD (현지 기준 날짜 필드, 가민이 표시용으로 사용)
+    - unitKey: "kg"
+    - weight: kg 값
+    """
+    return {
+        "timestampGMT": _epoch_millis_utc(w.dt_local),
+        "date": w.date_str,
+        "unitKey": UNIT_KEY,
+        "weight": round(w.weight_kg, 3),
+        # 필요한 경우 아래 확장 필드를 함께 넣을 수 있음
+        # "sourceType": "user",           # 또는 "SCALE"
+        # "suppressNotification": False,
+    }
+
+
+def login_and_session() -> Tuple[garth.Client, object]:
+    """
+    garth로 로그인 후 requests.Session 반환.
+    중요: connectapi **호출** 필요.
+    """
+    email = os.environ.get("GARMIN_EMAIL", "").strip()
+    password = os.environ.get("GARMIN_PASSWORD", "").strip()
     if not email or not password:
-        raise SystemExit("환경변수 GARMIN_EMAIL / GARMIN_PASSWORD 필요")
-
-    csv_file, df = _read_latest_csv()
-    print(f"[INFO] Selected CSV: {csv_file}")
-    print(f"[INFO] Columns: {list(df.columns)}")
+        raise RuntimeError("GARMIN_EMAIL / GARMIN_PASSWORD 환경변수 필요")
 
     client = garth.Client()
     client.login(email, password)
-    sess = client.connectapi
-    print("[INFO] Garmin login OK")
+
+    # **** 핵심 수정 포인트 ****
+    sess = client.connectapi()  # ← 호출해서 Session을 받는다
+    # ***************************
+
+    logger.info("Garmin login OK")
+    return client, sess
+
+
+def main():
+    csv_path = _read_latest_csv_in_cwd()
+    rows = _load_rows(csv_path)
+
+    if not rows:
+        logger.info("업로드할 유효한 행이 없습니다. 종료합니다.")
+        return
+
+    client, sess = login_and_session()
 
     success = 0
     failed = 0
-    for idx, row in df.iterrows():
+    for w in rows:
+        payload = _build_payload(w)
         try:
-            dt_local, kg = _parse_row_to_dt_kg(row)
-        except Exception as e:
-            print(f"[SKIP] row {idx}: 파싱 실패 - {e}")
-            failed += 1
-            continue
-
-        p1, p2 = _payloads_for(dt_local, kg)
-        res = _post_with_retries(sess, WEIGHT_POST_URL, p1)
-        if not res.ok:
-            res2 = _post_with_retries(sess, WEIGHT_POST_URL, p2)
-            if res2.ok:
-                success += 1
-                print(f"[OK]  row {idx}: {kg}kg @ {dt_local.isoformat()}  ({res2.status}, attempt={res2.attempt})")
-            else:
-                failed += 1
-                print(f"[FAIL] row {idx}: {kg}kg @ {dt_local.isoformat()}  "
-                      f"p1={res.status}/{res.text[:120]!r}, p2={res2.status}/{res2.text[:120]!r}")
-        else:
+            res = _post_with_retries(sess, WEIGHT_POST_URL, payload)
+            # 일부 엔드포인트는 body 없이 204/201 등 반환
+            logger.debug("POST OK %s", getattr(res, "status_code", "?"))
             success += 1
-            print(f"[OK]  row {idx}: {kg}kg @ {dt_local.isoformat()}  ({res.status}, attempt={res.attempt})")
+        except Exception as e:
+            failed += 1
+            logger.info("[FAIL] %s %.3fkg @ %s (%s) - %s",
+                        w.date_str,
+                        w.weight_kg,
+                        w.dt_local.isoformat(),
+                        payload.get("timestampGMT"),
+                        e)
 
-    print(f"Done. success={success}, failed={failed}")
+    logger.info("Done. success=%d, failed=%d", success, failed)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # 트레이스 요약 출력(액션 로그 가독성)
+        logger.exception(e)
+        raise
