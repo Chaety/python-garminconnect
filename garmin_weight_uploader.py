@@ -4,7 +4,7 @@ Garmin Weight Uploader
 - 작업 디렉토리의 *.csv 중 가장 최신 파일 자동 선택
 - '날짜' + '시간' → UTC timestamp 생성 후 가민 업로드
 - 필수 컬럼: 날짜, 몸무게
-- 선택 컬럼: 시간, 체지방률
+- 선택 컬럼: 시간
 """
 
 import os
@@ -17,7 +17,6 @@ from pathlib import Path
 DATE_COL   = "날짜"
 TIME_COL   = "시간"
 WEIGHT_COL = "몸무게"
-FAT_COL    = "체지방률"
 
 LOCAL_TZ = timezone(timedelta(hours=9))  # KST
 
@@ -91,8 +90,7 @@ def main():
 
     for idx, row in df.iterrows():
         ts_utc = parse_ts(row.get(DATE_COL), row.get(TIME_COL) if TIME_COL in df.columns else None)
-        weight = to_float(row.get(WEIGHT_COL))  # ← 변수명 weight
-        fat = to_float(row.get(FAT_COL)) if FAT_COL in df.columns else None
+        weight = to_float(row.get(WEIGHT_COL))
 
         if ts_utc is None or weight is None:
             print(f"[SKIP] {idx}: ts/weight 누락")
@@ -100,24 +98,21 @@ def main():
             continue
 
         if dry_run:
-            print(f"[DRY] {idx}: {ts_utc.isoformat()}, {weight}, {fat}")
+            print(f"[DRY] {idx}: {ts_utc.isoformat()}, {weight}")
             success += 1
             continue
 
         try:
-            # 최신 버전: add_weigh_in_with_timestamps(weight=..., percent_fat=..., bmi=..., timestamp=...)
             if hasattr(g, "add_weigh_in_with_timestamps"):
                 g.add_weigh_in_with_timestamps(
                     weight=weight,
-                    percent_fat=fat,
                     bmi=None,
                     timestamp=ts_utc.isoformat(timespec="milliseconds")
                 )
             else:
-                # 구버전: add_weigh_in(weight=..., percent_fat=..., bmi=...)
-                g.add_weigh_in(weight=weight, percent_fat=fat, bmi=None)
+                g.add_weigh_in(weight=weight, bmi=None)
 
-            print(f"[OK] {idx}: {ts_utc.isoformat()} UTC, {weight}kg, fat={fat}")
+            print(f"[OK] {idx}: {ts_utc.isoformat()} UTC, {weight}kg")
             success += 1
         except Exception as e:
             print(f"[FAIL] {idx}: {e}")
