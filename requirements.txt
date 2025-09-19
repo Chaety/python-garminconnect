@@ -1,0 +1,4 @@
+garminconnect
+pandas
+pytz
+python-dateutil
