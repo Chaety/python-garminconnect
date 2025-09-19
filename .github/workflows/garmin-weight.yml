@@ -1,0 +1,53 @@
+name: Garmin weight upload
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 매일 KST 06:30 실행 → UTC로 -9h = 전날 21:30
+    - cron: "30 21 * * *"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore Garmin token cache (~/.garminconnect)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # (선택) Google Drive 등 외부 URL에서 CSV 내려받아 덮어쓰기
+      - name: Download CSV from URL (optional)
+        if: env.CSV_URL != ''
+        env:
+          CSV_URL: ${{ secrets.CSV_URL }}
+        run: |
+          curl -L "$CSV_URL" -o "무게 2025.09.18 Google Fit.csv" || echo "Skip CSV download"
+
+      - name: Run uploader
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          # 필요 시 DRY_RUN=1로 미리 점검 가능
+        run: |
+          python garmin_weight_uploader.py
+
+      - name: Save Garmin token cache (first run only)
+        if: steps.cache-hit.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
