@@ -28,7 +28,7 @@ jobs:
         run: |
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      # 서비스 계정 JSON을 안전하게 기록 (heredoc)
+      # 서비스 계정 JSON 기록
       - name: Write service account JSON
         shell: bash
         run: |
@@ -44,7 +44,7 @@ jobs:
           print("JSON OK")
           PY
 
-      # ✅ rclone.conf 에 root_folder_id 를 직접 주입
+      # rclone config 생성 (root_folder_id 고정)
       - name: Create rclone config (root_folder_id pinned)
         env:
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -58,25 +58,26 @@ jobs:
           EOF
           echo "rclone.conf created with root_folder_id=${{ secrets.GDRIVE_FOLDER_ID }}"
 
-      # 🔎 폴더 루트에서 보이는 파일 목록 출력
+      # 디버그: 폴더 내용 출력
       - name: DEBUG - List files (name,size,modtime)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
-          rclone lsl gdrive: --recursive || true
+          rclone lsl gdrive: || true
 
-      # ⬇️ 폴더 전체 복사 (Sheets는 CSV로 export)
+      # CSV 다운로드
       - name: Download all (export Sheets→CSV)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -e
           rclone copy gdrive: . \
-            --recursive \
             --drive-export-formats csv \
             --progress
+
           echo "Workspace files after download:"
           ls -al || true
+
           echo "CSV files present:"
           ls -al *.csv || true
 
