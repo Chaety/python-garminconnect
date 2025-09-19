@@ -28,7 +28,7 @@ jobs:
         run: |
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      # ✅ Heredoc으로 서비스 계정 JSON을 안전하게 작성
+      # 서비스 계정 JSON을 안전하게 기록 (heredoc, 원문 그대로)
       - name: Write service account JSON
         shell: bash
         run: |
@@ -36,7 +36,7 @@ jobs:
           ${{ secrets.GDRIVE_SA_JSON }}
           JSON
 
-      # ✅ JSON 구조 검증
+      # JSON 구조 검증
       - name: Validate service account JSON (quick)
         run: |
           head -c 1 sa.json | grep '{' >/dev/null || (echo "sa.json is not starting with {" && exit 1)
@@ -63,12 +63,19 @@ jobs:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          # 최신 CSV 선택
-          rclone lsf "gdrive:$FOLDER_ID" --files-only --format "pt" --recursive \
+          set -e
+
+          echo "Using Drive folder id: ${FOLDER_ID}"
+
+          # 목록 가져오기: 폴더 ID를 루트로 지정하여 그 아래만 탐색
+          # format: p(path) t(modtime)
+          rclone lsf gdrive: \
+            --drive-root-folder-id "${FOLDER_ID}" \
+            --files-only --format "pt" --recursive \
             | grep -E '\.csv$' \
             | sort -k2 \
             | tail -n 1 \
-            | awk '{print $1}' > latest.txt
+            | awk '{print $1}' > latest.txt || true
 
           if [ ! -s latest.txt ]; then
             echo "No CSV found in Drive folder."
@@ -76,10 +83,17 @@ jobs:
           fi
 
           LATEST_FILE=$(cat latest.txt)
-          echo "Latest CSV in Drive: $LATEST_FILE"
-          rclone copy "gdrive:$FOLDER_ID/$LATEST_FILE" . --progress
+          echo "Latest CSV in Drive (relative to folder root): $LATEST_FILE"
 
-          echo "Downloaded:"
+          # 선택된 파일 다운로드 (폴더 ID를 루트로 동일하게 지정)
+          rclone copy "gdrive:${LATEST_FILE}" . \
+            --drive-root-folder-id "${FOLDER_ID}" \
+            --progress
+
+          echo "Downloaded files in workspace:"
+          ls -al
+
+          echo "Downloaded CSVs matching pattern:"
           ls -al "무게 "*.csv || true
 
       - name: Restore Garmin token cache (~/.garminconnect)
