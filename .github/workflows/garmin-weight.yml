@@ -58,23 +58,9 @@ jobs:
           service_account_file = sa.json
           EOF
 
-      # 🔎 1) 폴더 내 전체 파일/폴더 구조를 먼저 출력 (접근/공유/경로 확인)
-      - name: DEBUG - List folder tree (names only)
-        env:
-          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
-          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          echo "Using Drive folder id: ${FOLDER_ID}"
-          echo ">>> rclone lsd (top-level dirs under folder root):"
-          rclone lsd gdrive:/ --drive-root-folder-id "${FOLDER_ID}" --drive-shared-with-me || true
-          echo ">>> rclone lsf (files with modtime, recursively):"
-          rclone lsf gdrive:/ \
-            --drive-root-folder-id "${FOLDER_ID}" \
-            --drive-shared-with-me \
-            --files-only --recursive --format "pt" || true
-
-      # 2) 최신 CSV(대소문자 무시) 또는 구글시트(이름만 있고 확장자 없는 경우)까지 커버
-      - name: Download latest CSV from Drive folder
+      # 🔁 폴더 전체 복사: 스프레드시트는 CSV로 내보내기(export)하여 모두 다운로드
+      #    → 로컬에서 *.csv 중 최신 1개를 파이썬이 선택
+      - name: Download all files from Drive folder (export Sheets→CSV)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -82,74 +68,18 @@ jobs:
           set -e
           echo "Using Drive folder id: ${FOLDER_ID}"
 
-          # 전체 파일 목록 (경로 + 수정시각)
-          rclone lsf gdrive:/ \
+          # 폴더를 루트로 지정하고 그 하위 전체를 현재 작업 디렉토리로 복사
+          rclone copy gdrive:/ . \
             --drive-root-folder-id "${FOLDER_ID}" \
             --drive-shared-with-me \
-            --files-only --recursive --format "pt" > all_files.txt
-
-          echo "Total files found under folder root:"
-          wc -l all_files.txt || true
-
-          # 2-1) 우선 .csv(대소문자 무시)만 추출
-          grep -Ei '\.csv$' all_files.txt | sort -k2 | tail -n 1 | awk '{print $1}' > latest_csv.txt || true
-
-          if [ -s latest_csv.txt ]; then
-            LATEST_FILE=$(cat latest_csv.txt)
-            echo "Latest CSV file: $LATEST_FILE"
-            # 무게 *.csv 패턴이면 우선 사용(원치 않으면 다음 두 줄 삭제)
-            if echo "$LATEST_FILE" | grep -qE '^무게 .*\.csv$'; then
-              echo "Matches '무게 *.csv' pattern."
-            fi
-
-            # 일반 파일 다운로드
-            rclone copy "gdrive:${LATEST_FILE}" . \
-              --drive-root-folder-id "${FOLDER_ID}" \
-              --drive-shared-with-me \
-              --progress
-
-          else
-            echo "No .csv file found directly. Trying Google Sheets export → CSV..."
-
-            # 2-2) 확장자 없는 구글 시트(스프레드시트) 후보 중 최신 1개 선택
-            #   - csv가 전혀 없을 때만 시도
-            #   - 이름 중 '무게' 포함된 파일을 우선 고려(없으면 전체 중 최신)
-            awk '{print $1,$2}' all_files.txt > all_paths.txt
-
-            # '무게' 포함 후보
-            awk '/무게/ {print $0}' all_paths.txt | sort -k2 | tail -n 1 | awk '{print $1}' > latest_sheet.txt || true
-
-            if [ ! -s latest_sheet.txt ]; then
-              # 폴더 내 가장 최신 파일 하나(확장자 여부 무관)
-              sort -k2 all_paths.txt | tail -n 1 | awk '{print $1}' > latest_sheet.txt || true
-            fi
-
-            if [ ! -s latest_sheet.txt ]; then
-              echo "No suitable file found in Drive folder."
-              exit 1
-            fi
-
-            LATEST_SHEET=$(cat latest_sheet.txt)
-            echo "Latest candidate for export: $LATEST_SHEET"
-
-            # 구글 시트 → CSV로 내보내며 다운로드 (스프레드시트에만 적용됨)
-            # 파일명이 확장자 없이 내려오면 rclone이 'csv'로 내보내기 할 수 있음.
-            rclone copy "gdrive:${LATEST_SHEET}" . \
-              --drive-root-folder-id "${FOLDER_ID}" \
-              --drive-shared-with-me \
-              --drive-export-formats csv \
-              --progress || true
-          fi
+            --drive-export-formats csv \
+            --progress
 
           echo "Workspace files after download:"
-          ls -al
+          ls -al || true
 
           echo "CSV files present:"
           ls -al *.csv || true
-
-          # 마지막으로 '무게 *.csv'가 있다면 그 파일을 그대로 사용하도록 이름을 출력(정보용)
-          echo "무게 *.csv files (if any):"
-          ls -al "무게 "*.csv || true
 
       - name: Restore Garmin token cache (~/.garminconnect)
         id: restore_token
