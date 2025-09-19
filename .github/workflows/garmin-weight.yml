@@ -1,36 +1,41 @@
-name: Garmin weight upload
+name: Garmin Weight Uploader (Drive → Garmin)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 21 * * *"   # KST 06:30 (UTC 21:30)
+    - cron: "30 21 * * *"   # 매일 KST 06:30 (UTC 21:30)
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # 로그인 잘 되던 최신 조합 사용 (버전 핀 X)
+          pip install --upgrade garminconnect garth
 
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Write service account JSON
+      - name: Write Google SA JSON
         shell: bash
         run: |
           cat > sa.json <<'JSON'
           ${{ secrets.GDRIVE_SA_JSON }}
           JSON
 
-      - name: Create rclone config (root_folder_id pinned)
+      - name: Create rclone config (root_folder pinned)
         env:
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
@@ -42,18 +47,40 @@ jobs:
           root_folder_id = ${FOLDER_ID}
           EOF
 
-      - name: Download CSVs from Drive
+      - name: DEBUG - list remote
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: rclone lsl gdrive: || true
+
+      - name: Download CSVs from Drive (export Sheets→CSV)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
-          rclone copy gdrive: . --drive-export-formats csv --progress
-          echo "Workspace files:" && ls -al
-          echo "CSV files:" && ls -al *.csv || true
+          set -e
+          # 구글 스프레드시트면 CSV로 익스포트, 일반 파일이면 그대로
+          rclone copy gdrive: . --drive-export-formats csv
+          echo "Workspace files:"; ls -al
+          echo "CSV files:"; ls -al *.csv || true
+          # 최신 CSV 미리보기
+          (ls -t *.csv 2>/dev/null | head -n 1 | xargs -I{} sh -c 'echo ">>> {}"; head -n 5 "{}"') || true
+
+      - name: Restore Garmin token cache (~/.garminconnect)
+        id: restore_token
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
 
       - name: Upload to Garmin
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          # DRY_RUN: "1"   # ← 테스트 모드 원하면 주석 해제
-        run: |
-          python garmin_weight_uploader.py
+          # DRY_RUN: "1"   # 테스트 모드 필요하면 주석 해제
+        run: python garmin_weight_uploader.py
+
+      - name: Save Garmin token cache (first run only)
+        if: steps.restore_token.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
