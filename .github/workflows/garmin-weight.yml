@@ -36,48 +36,47 @@ jobs:
           ${{ secrets.GDRIVE_SA_JSON }}
           JSON
 
-      # JSON 구조 검증
-      - name: Validate service account JSON (quick)
-        run: |
-          head -c 1 sa.json | grep '{' >/dev/null || (echo "sa.json is not starting with {" && exit 1)
-
-      - name: Validate JSON with Python
+      # JSON 검증
+      - name: Validate JSON
         run: |
           python - <<'PY'
-          import json
-          json.load(open('sa.json','r', encoding='utf-8'))
+          import json; json.load(open('sa.json','r',encoding='utf-8'))
           print("JSON OK")
           PY
 
-      - name: Create rclone config for Drive (service account)
+      # ✅ rclone.conf 에 root_folder_id 를 직접 주입
+      - name: Create rclone config (root_folder_id pinned)
+        env:
+          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          cat > rclone.conf << 'EOF'
+          cat > rclone.conf << EOF
           [gdrive]
           type = drive
           scope = drive.readonly
-          service_account_file = sa.json
+          service_account_file = ${PWD}/sa.json
+          root_folder_id = ${FOLDER_ID}
           EOF
+          echo "rclone.conf created with root_folder_id=${{ secrets.GDRIVE_FOLDER_ID }}"
 
-      # 🔁 폴더 전체 복사: 스프레드시트는 CSV로 내보내기(export)하여 모두 다운로드
-      #    → 로컬에서 *.csv 중 최신 1개를 파이썬이 선택
-      - name: Download all files from Drive folder (export Sheets→CSV)
+      # 🔎 폴더 루트에서 보이는 파일 목록 출력
+      - name: DEBUG - List files (name,size,modtime)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
-          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rclone lsl gdrive: --recursive || true
+
+      # ⬇️ 폴더 전체 복사 (Sheets는 CSV로 export)
+      - name: Download all (export Sheets→CSV)
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -e
-          echo "Using Drive folder id: ${FOLDER_ID}"
-
-          # 폴더를 루트로 지정하고 그 하위 전체를 현재 작업 디렉토리로 복사
-          rclone copy gdrive:/ . \
-            --drive-root-folder-id "${FOLDER_ID}" \
-            --drive-shared-with-me \
+          rclone copy gdrive: . \
+            --recursive \
             --drive-export-formats csv \
             --progress
-
           echo "Workspace files after download:"
           ls -al || true
-
           echo "CSV files present:"
           ls -al *.csv || true
 
