@@ -9,11 +9,13 @@ Garmin Connect에 체중 기록을 업로드합니다.
 - GARMIN_EMAIL
 - GARMIN_PASSWORD
 
-주요 변경점
-- POST /userprofile-service/userprofile/weight (X)
-+ POST /weight-service/weight (O)
-- payload: value / gmtTimestamp (X)
-+ payload: weight / timestampGMT (O)
+주요 사항
+- 엔드포인트: POST /weight-service/weight
+- 페이로드 키: weight / unitKey / timestampGMT / timestampLocal / sourceType
+  * timestamp* 는 epoch milliseconds
+  * sourceType 은 USER_ENTERED 로 지정
+- 409(중복)은 성공으로 간주
+- 400 발생 시 응답 본문도 함께 출력하도록 개선
 
 요구 패키지: pandas, python-dateutil, garth, requests
 """
@@ -40,6 +42,7 @@ except Exception as e:  # pragma: no cover
     sys.exit(2)
 
 
+# 현재 가민 Connect API 체중 업로드 경로
 WEIGHT_POST_PATH = "/weight-service/weight"
 
 # CSV 컬럼(한국어 Google Fit/스마트체중계 내보내기 포맷 가정)
@@ -62,69 +65,75 @@ def _find_latest_csv(patterns: Tuple[str, ...] = ("*.csv",)) -> Optional[str]:
     return candidates[0]
 
 
-def _parse_datetime_utc(date_str: str, time_str: str, local_tz_name: str) -> datetime:
+def _parse_datetime_local(date_str: str, time_str: str, local_tz_name: str) -> datetime:
     """
-    CSV의 '날짜','시간' 문자열을 로컬 타임존 기준의 naive datetime으로 파싱 후 UTC로 변환.
+    CSV의 '날짜','시간' 문자열을 로컬 타임존 기준 aware datetime으로 파싱.
     - 날짜 예: '2025.09.18 00:00:00' 또는 '2025.09.18'
     - 시간 예: '03:19:22'
     """
-    # 날짜 문자열에 시간이 포함될 수도 있어서 안전 처리
     date_str = (date_str or "").strip()
     time_str = (time_str or "").strip()
 
     if time_str:
-        # 'YYYY.MM.DD HH:MM:SS' 형태로 합치기
         combined = f"{date_str.split(' ')[0]} {time_str}"
-        dt_local = datetime.strptime(combined, "%Y.%m.%d %H:%M:%S")
+        dt_naive = datetime.strptime(combined, "%Y.%m.%d %H:%M:%S")
     else:
-        # 시간 미기재 시 자정
-        dt_local = datetime.strptime(date_str.split(' ')[0], "%Y.%m.%d")
+        dt_naive = datetime.strptime(date_str.split(' ')[0], "%Y.%m.%d")
 
-    # 타임존 부여 후 UTC로 변환
     local_tz = tz.gettz(local_tz_name) or tz.gettz("UTC")
-    dt_local = dt_local.replace(tzinfo=local_tz)
+    return dt_naive.replace(tzinfo=local_tz)
+
+
+def _to_utc(dt_local: datetime) -> datetime:
     return dt_local.astimezone(timezone.utc)
 
 
-def _epoch_ms(dt_utc: datetime) -> int:
-    """UTC datetime -> epoch milliseconds"""
-    return int(dt_utc.timestamp() * 1000)
+def _epoch_ms(dt: datetime) -> int:
+    """aware datetime -> epoch milliseconds"""
+    return int(dt.timestamp() * 1000)
 
 
 def _login_garmin(email: str, password: str) -> Client:
     """garth 클라이언트 로그인."""
     client = Client()
     # 토큰 캐시 디렉토리(있으면 사용)
-    token_dir = os.path.expanduser("~/.garminconnect")
     try:
-        os.makedirs(token_dir, exist_ok=True)
+        os.makedirs(os.path.expanduser("~/.garminconnect"), exist_ok=True)
     except Exception:
         pass
-
     client.login(email, password)
     return client
 
 
-def _post_weight(client: Client, when_utc: datetime, kg: float) -> None:
+def _post_weight(client: Client, when_local: datetime, when_utc: datetime, kg: float) -> None:
     """가민에 체중 1건 업로드. 409 중복은 성공 처리."""
-    epoch_ms = _epoch_ms(when_utc)
     payload = {
-        "date": when_utc.strftime("%Y-%m-%d"),
-        "timestampGMT": epoch_ms,   # epoch millis (UTC)
+        # 필수값들
         "weight": float(kg),
         "unitKey": "kg",
+        "timestampLocal": _epoch_ms(when_local),  # 로컬 타임존 기준 epoch ms
+        "timestampGMT": _epoch_ms(when_utc),      # UTC 기준 epoch ms
+        "sourceType": "USER_ENTERED",             # 수동 입력
     }
 
     try:
-        client.connectapi(WEIGHT_POST_PATH, method="POST", json=payload)
+        resp = client.connectapi(WEIGHT_POST_PATH, method="POST", json=payload)
+        # 일부 배포에선 201 / 200 / 204 다양하게 반환될 수 있어, 예외 없으면 성공 처리
+        return
     except HTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
+        text = ""
+        try:
+            text = e.response.text[:500] if e.response is not None else ""
+        except Exception:
+            pass
+
         if status == 409:
-            # 동일 타임스탬프 데이터가 이미 존재 — 성공으로 간주
-            print(f"[INFO] [DUPLICATE->OK] {kg}kg @ {when_utc.isoformat()} ({epoch_ms})")
+            print(f"[INFO] [DUPLICATE->OK] {kg}kg @ {when_utc.isoformat()} {_epoch_ms(when_utc)}")
             return
-        # 그 외 오류는 재전파
-        raise
+
+        # 400 등 나머지는 에러 재전파
+        raise HTTPError(f"{e} | body={text}") from e
 
 
 def main() -> int:
@@ -182,29 +191,28 @@ def main() -> int:
             if not date_str or not weight_str:
                 continue
 
-            # 따옴표로 감싼 숫자 처리: "70.79891"
             try:
                 kg = float(weight_str.strip('"'))
             except ValueError:
                 continue
 
-            # 0 또는 NaN/비정상 무게 스킵
             if kg <= 0 or math.isinf(kg) or math.isnan(kg):
                 continue
 
-            when_utc = _parse_datetime_utc(date_str, time_str, csv_tz)
+            when_local = _parse_datetime_local(date_str, time_str, csv_tz)
+            when_utc = _to_utc(when_local)
 
             try:
-                _post_weight(client, when_utc, kg)
+                _post_weight(client, when_local, when_utc, kg)
                 print(
                     f"[INFO] [OK] {when_utc.date()} {kg}kg @ {when_utc.isoformat()} ({_epoch_ms(when_utc)})"
                 )
                 success += 1
             except HTTPError as e:
-                code = getattr(getattr(e, "response", None), "status_code", "?")
+                # 여기서 status/body 함께 출력함
                 print(
                     f"[INFO] [FAIL] {when_utc.date()} {kg}kg @ {when_utc.isoformat()} "
-                    f"({_epoch_ms(when_utc)}) - Error in request: {e} (status={code})"
+                    f"({_epoch_ms(when_utc)}) - Error in request: {e}"
                 )
                 failed += 1
             except Exception as e:
@@ -216,12 +224,12 @@ def main() -> int:
 
         except Exception as e:
             failed += 1
-            print(f"[WARN] 인덱스 {idx} 처리 중 예외: {e}")
+            print(f".[WARN] 인덱스 {idx} 처리 중 예외: {e}")
             traceback.print_exc()
 
     print(f"[INFO] Done. success={success}, failed={failed}")
-    # 실패가 있어도 전체 파이프라인 실패 여부는 정책에 맞게 반환
-    return 0 if failed == 0 else 0  # 실패가 있어도 워크플로우 계속 통과시키려면 0
+    # 실패가 있어도 CI 전체 실패로 보지 않도록 0 반환(원하면 1로 바꾸세요)
+    return 0
 
 
 if __name__ == "__main__":
