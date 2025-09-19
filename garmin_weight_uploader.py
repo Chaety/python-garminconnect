@@ -1,121 +1,98 @@
-# -*- coding: utf-8 -*-
-"""
-Drive에서 받은 최신 CSV 1개를 읽어 Garmin Connect에 체중 업로드.
-- 컬럼명(한글, 고정): 날짜(필수), 몸무게(필수), 시간(선택)
-- 시간은 KST로 해석 후 UTC로 변환해 업로드 시도
-- 라이브러리 버전에 따라:
-    1) add_weigh_in_with_timestamps(weight, timestamp) 시도
-    2) add_weigh_in(weight) 로 폴백 (이 경우 가민에 '업로드 시각'으로 기록됨)
-- 환경변수 DRY_RUN=1 이면 업로드 대신 파싱 결과만 로그 출력
-"""
+name: Garmin Weight Uploader (Drive → Garmin)
 
-import os
-import sys
-from pathlib import Path
-from datetime import timezone, timedelta
-import pandas as pd
-from dateutil import parser as dateparser
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 21 * * *"   # 매일 KST 06:30 (UTC 21:30)
 
-DATE_COL   = "날짜"
-TIME_COL   = "시간"
-WEIGHT_COL = "몸무게"
-KST = timezone(timedelta(hours=9))
+jobs:
+  run:
+    runs-on: ubuntu-latest
 
-def pick_latest_csv() -> Path:
-    files = sorted(Path(".").glob("*.csv"))
-    if not files:
-        print("[ERROR] *.csv not found in workspace")
-        sys.exit(1)
-    latest = max(files, key=lambda p: p.stat().st_mtime)
-    print(f"[INFO] Selected CSV: {latest}")
-    return latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-def read_csv(path: Path) -> pd.DataFrame:
-    for enc in ("utf-8-sig", "utf-8", "cp949"):
-        try:
-            return pd.read_csv(path, encoding=enc)
-        except Exception:
-            continue
-    print("[ERROR] Failed to read CSV (utf-8-sig/utf-8/cp949 tried)")
-    sys.exit(1)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-def to_float(x):
-    try:
-        s = str(x).strip().replace(",", "").replace("%", "")
-        return float(s) if s else None
-    except Exception:
-        return None
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # 로그인 잘되던 최신 조합 사용(핀 없음)
+          pip install --upgrade garminconnect garth
+          python - <<'PY'
+          from importlib.metadata import version, PackageNotFoundError
+          for p in ["garminconnect","garth","pandas","python-dateutil"]:
+              try:
+                  print(p, version(p))
+              except PackageNotFoundError:
+                  print(p, "not installed")
+          PY
 
-def parse_ts(date_val, time_val):
-    if pd.isna(date_val) or str(date_val).strip() == "":
-        return None
-    text = str(date_val) if (time_val is None or str(time_val).strip() == "") else f"{date_val} {time_val}"
-    dt = dateparser.parse(text)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=KST)
-    return dt.astimezone(timezone.utc)
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
 
-def main():
-    email = os.getenv("GARMIN_EMAIL")
-    password = os.getenv("GARMIN_PASSWORD")
-    dry_run = os.getenv("DRY_RUN", "0") == "1"
+      - name: Write Google Service Account JSON
+        shell: bash
+        run: |
+          cat > sa.json <<'JSON'
+          ${{ secrets.GDRIVE_SA_JSON }}
+          JSON
 
-    csv_path = pick_latest_csv()
-    df = read_csv(csv_path)
-    print("[INFO] Columns:", list(df.columns))
+      - name: Create rclone config (root_folder pinned)
+        env:
+          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          cat > rclone.conf << EOF
+          [gdrive]
+          type = drive
+          scope = drive.readonly
+          service_account_file = ${PWD}/sa.json
+          root_folder_id = ${FOLDER_ID}
+          EOF
+          echo "Rclone config written"
 
-    for col in (DATE_COL, WEIGHT_COL):
-        if col not in df.columns:
-            print(f"[ERROR] Missing column: {col}")
-            sys.exit(1)
+      - name: DEBUG - list remote
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          rclone lsl gdrive: || true
 
-    from garminconnect import Garmin
-    client = Garmin(email, password)
-    client.login()
-    print("[INFO] Garmin login OK")
+      - name: Download CSVs from Drive (export Sheets→CSV)
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          set -e
+          rclone copy gdrive: . --drive-export-formats csv
+          echo "Workspace files:" && ls -al
+          echo "CSV files:" && ls -al *.csv || true
+          # 최신 CSV 미리보기
+          (ls -t *.csv 2>/dev/null | head -n 1 | xargs -I{} sh -c 'echo ">>> {}"; head -n 5 "{}"') || true
 
-    success, failed = 0, 0
+      - name: Restore Garmin token cache (~/.garminconnect)
+        id: restore_token
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
 
-    for i, row in df.iterrows():
-        ts_utc = parse_ts(row.get(DATE_COL), row.get(TIME_COL) if TIME_COL in df.columns else None)
-        weight = to_float(row.get(WEIGHT_COL))
+      - name: Upload to Garmin
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          # DRY_RUN: "1"   # 필요하면 테스트 모드로
+        run: |
+          python garmin_weight_uploader.py
 
-        if ts_utc is None or weight is None:
-            print(f"[SKIP] {i}: ts/weight missing -> {row.get(DATE_COL)} {row.get(TIME_COL)} {row.get(WEIGHT_COL)}")
-            failed += 1
-            continue
-
-        if dry_run:
-            print(f"[DRY] {i}: {ts_utc.isoformat()} UTC, {weight}kg")
-            success += 1
-            continue
-
-        # 1) timestamp 지원 시도
-        try:
-            if hasattr(client, "add_weigh_in_with_timestamps"):
-                client.add_weigh_in_with_timestamps(
-                    weight=weight,
-                    timestamp=ts_utc.isoformat(timespec="milliseconds")
-                )
-                print(f"[OK] {i}: with timestamp -> {ts_utc.isoformat()} UTC, {weight}kg")
-                success += 1
-                continue
-        except TypeError:
-            # 시그니처 불일치 → 폴백
-            pass
-        except Exception as e:
-            print(f"[WARN] with_timestamps failed: {e}")
-
-        # 2) 폴백: weight만 업로드
-        try:
-            client.add_weigh_in(weight=weight)
-            print(f"[OK] {i}: weight only -> {weight}kg")
-            success += 1
-        except Exception as e:
-            print(f"[FAIL] {i}: {e}")
-            failed += 1
-
-    print(f"Done. success={success}, failed={failed}")
-
-if __name__ == "__main__":
-    main()
+      - name: Save Garmin token cache (first run only)
+        if: steps.restore_token.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.garminconnect
+          key: garmin-token-v1
