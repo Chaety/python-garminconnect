@@ -9,15 +9,15 @@ Garmin Connect에 체중 기록을 업로드합니다.
 - GARMIN_EMAIL
 - GARMIN_PASSWORD
 
+선택 환경변수
+- CSV_TZ (기본: Asia/Seoul)  # CSV의 '날짜/시간'이 기록된 로컬 타임존
+
 주요 사항
 - 엔드포인트: POST /weight-service/weight
 - 페이로드 키: weight / unitKey / timestampGMT / timestampLocal / sourceType
-  * timestamp* 는 epoch milliseconds
-  * sourceType 은 USER_ENTERED 로 지정
+- weight는 소수점 2자리로 반올림
+- timestampLocal/ timestampGMT 는 서로 타임존 오프셋만큼 차이나야 함(미스매치 시 400 가능)
 - 409(중복)은 성공으로 간주
-- 400 발생 시 응답 본문도 함께 출력하도록 개선
-
-요구 패키지: pandas, python-dateutil, garth, requests
 """
 
 from __future__ import annotations
@@ -35,52 +35,45 @@ from dateutil import tz
 from requests import HTTPError
 
 try:
-    # garth 0.5.x
     from garth import Client
-except Exception as e:  # pragma: no cover
+except Exception as e:
     print(f"[FATAL] garth import 실패: {e}", file=sys.stderr)
     sys.exit(2)
 
-
-# 현재 가민 Connect API 체중 업로드 경로
 WEIGHT_POST_PATH = "/weight-service/weight"
 
-# CSV 컬럼(한국어 Google Fit/스마트체중계 내보내기 포맷 가정)
 COL_DATE = "날짜"
 COL_TIME = "시간"
 COL_WEIGHT = "몸무게"
 
-# 기본 타임존: 환경변수 TZ(예: Asia/Seoul) > UTC
-DEFAULT_TZ = os.environ.get("CSV_TZ") or os.environ.get("TZ") or "UTC"
+# 기본 타임존: 한국 데이터 가정 (필요 시 CSV_TZ 로 변경)
+DEFAULT_TZ = os.environ.get("CSV_TZ") or "Asia/Seoul"
 
 
 def _find_latest_csv(patterns: Tuple[str, ...] = ("*.csv",)) -> Optional[str]:
-    """현재 작업 디렉토리에서 가장 최근 CSV 파일 1개 선택."""
-    candidates = []
+    files = []
     for pat in patterns:
-        candidates.extend(glob.glob(pat))
-    if not candidates:
+        files.extend(glob.glob(pat))
+    if not files:
         return None
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates[0]
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
 
 
 def _parse_datetime_local(date_str: str, time_str: str, local_tz_name: str) -> datetime:
-    """
-    CSV의 '날짜','시간' 문자열을 로컬 타임존 기준 aware datetime으로 파싱.
-    - 날짜 예: '2025.09.18 00:00:00' 또는 '2025.09.18'
-    - 시간 예: '03:19:22'
-    """
     date_str = (date_str or "").strip()
     time_str = (time_str or "").strip()
 
+    # 일부 내보내기 포맷이 'YYYY.MM.DD HH:MM:SS' 형태로 날짜 열에 시간까지 들어있는 경우가 있어 split 처리
+    base_date = date_str.split(" ")[0]
+
     if time_str:
-        combined = f"{date_str.split(' ')[0]} {time_str}"
+        combined = f"{base_date} {time_str}"
         dt_naive = datetime.strptime(combined, "%Y.%m.%d %H:%M:%S")
     else:
-        dt_naive = datetime.strptime(date_str.split(' ')[0], "%Y.%m.%d")
+        dt_naive = datetime.strptime(base_date, "%Y.%m.%d")
 
-    local_tz = tz.gettz(local_tz_name) or tz.gettz("UTC")
+    local_tz = tz.gettz(local_tz_name) or tz.gettz("Asia/Seoul") or tz.UTC
     return dt_naive.replace(tzinfo=local_tz)
 
 
@@ -89,14 +82,11 @@ def _to_utc(dt_local: datetime) -> datetime:
 
 
 def _epoch_ms(dt: datetime) -> int:
-    """aware datetime -> epoch milliseconds"""
-    return int(dt.timestamp() * 1000)
+    return int(round(dt.timestamp() * 1000))
 
 
 def _login_garmin(email: str, password: str) -> Client:
-    """garth 클라이언트 로그인."""
     client = Client()
-    # 토큰 캐시 디렉토리(있으면 사용)
     try:
         os.makedirs(os.path.expanduser("~/.garminconnect"), exist_ok=True)
     except Exception:
@@ -106,38 +96,45 @@ def _login_garmin(email: str, password: str) -> Client:
 
 
 def _post_weight(client: Client, when_local: datetime, when_utc: datetime, kg: float) -> None:
-    """가민에 체중 1건 업로드. 409 중복은 성공 처리."""
+    # 가민이 소수점 2자리까지 허용하는 배포가 있어 반올림
+    kg2 = round(float(kg), 2)
+
     payload = {
-        # 필수값들
-        "weight": float(kg),
+        "weight": kg2,
         "unitKey": "kg",
-        "timestampLocal": _epoch_ms(when_local),  # 로컬 타임존 기준 epoch ms
+        "timestampLocal": _epoch_ms(when_local),  # 로컬 기준 epoch ms
         "timestampGMT": _epoch_ms(when_utc),      # UTC 기준 epoch ms
-        "sourceType": "USER_ENTERED",             # 수동 입력
+        "sourceType": "USER_ENTERED",
     }
 
     try:
-        resp = client.connectapi(WEIGHT_POST_PATH, method="POST", json=payload)
-        # 일부 배포에선 201 / 200 / 204 다양하게 반환될 수 있어, 예외 없으면 성공 처리
+        client.connectapi(WEIGHT_POST_PATH, method="POST", json=payload)
         return
     except HTTPError as e:
+        # 상태/본문 최대한 자세히 출력
         status = getattr(getattr(e, "response", None), "status_code", None)
-        text = ""
+        body = ""
         try:
-            text = e.response.text[:500] if e.response is not None else ""
+            if e.response is not None:
+                # 본문이 JSON일 수도, 텍스트일 수도 있음
+                ctype = e.response.headers.get("Content-Type", "")
+                if "application/json" in ctype:
+                    body = e.response.text
+                else:
+                    body = e.response.text
+                body = (body or "")[:1000]
         except Exception:
             pass
 
         if status == 409:
-            print(f"[INFO] [DUPLICATE->OK] {kg}kg @ {when_utc.isoformat()} {_epoch_ms(when_utc)}")
+            print(f"[INFO] [DUPLICATE->OK] {kg2}kg @ {when_utc.isoformat()} {_epoch_ms(when_utc)}")
             return
 
-        # 400 등 나머지는 에러 재전파
-        raise HTTPError(f"{e} | body={text}") from e
+        # 디버깅을 위해 상태/본문을 포함해 예외 재던짐
+        raise HTTPError(f"{status} Error | body={body}") from e
 
 
 def main() -> int:
-    # 환경변수
     email = os.environ.get("GARMIN_EMAIL") or ""
     password = os.environ.get("GARMIN_PASSWORD") or ""
     csv_tz = DEFAULT_TZ
@@ -146,7 +143,6 @@ def main() -> int:
         print("[FATAL] 환경변수 GARMIN_EMAIL / GARMIN_PASSWORD 가 필요합니다.", file=sys.stderr)
         return 2
 
-    # 최신 CSV 선택
     csv_path = _find_latest_csv()
     if not csv_path:
         print("[FATAL] 작업 디렉토리에 CSV 파일이 없습니다.", file=sys.stderr)
@@ -154,23 +150,18 @@ def main() -> int:
 
     print(f"[INFO] Selected CSV: {csv_path}")
 
-    # CSV 로드
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
         print(f"[FATAL] CSV 로드 실패: {e}", file=sys.stderr)
         return 1
 
-    cols = list(df.columns)
-    print(f"[INFO] Columns: {cols}")
-
-    # 필수 컬럼 점검
+    print(f"[INFO] Columns: {list(df.columns)}")
     missing = [c for c in (COL_DATE, COL_TIME, COL_WEIGHT) if c not in df.columns]
     if missing:
         print(f"[FATAL] 필수 컬럼 누락: {missing}", file=sys.stderr)
         return 1
 
-    # 로그인
     try:
         client = _login_garmin(email, password)
         print("[INFO] Garmin login OK (garth)")
@@ -181,7 +172,6 @@ def main() -> int:
     success = 0
     failed = 0
 
-    # 행 순회
     for idx, row in df.iterrows():
         try:
             date_str = str(row.get(COL_DATE, "")).strip()
@@ -192,32 +182,29 @@ def main() -> int:
                 continue
 
             try:
-                kg = float(weight_str.strip('"'))
+                kg_raw = float(weight_str.strip('"'))
             except ValueError:
                 continue
 
-            if kg <= 0 or math.isinf(kg) or math.isnan(kg):
+            if kg_raw <= 0 or math.isinf(kg_raw) or math.isnan(kg_raw):
                 continue
 
             when_local = _parse_datetime_local(date_str, time_str, csv_tz)
             when_utc = _to_utc(when_local)
 
             try:
-                _post_weight(client, when_local, when_utc, kg)
-                print(
-                    f"[INFO] [OK] {when_utc.date()} {kg}kg @ {when_utc.isoformat()} ({_epoch_ms(when_utc)})"
-                )
+                _post_weight(client, when_local, when_utc, kg_raw)
+                print(f"[INFO] [OK] {when_utc.date()} {round(kg_raw,2)}kg @ {when_utc.isoformat()} ({_epoch_ms(when_utc)})")
                 success += 1
             except HTTPError as e:
-                # 여기서 status/body 함께 출력함
                 print(
-                    f"[INFO] [FAIL] {when_utc.date()} {kg}kg @ {when_utc.isoformat()} "
-                    f"({_epoch_ms(when_utc)}) - Error in request: {e}"
+                    f"[INFO] [FAIL] {when_utc.date()} {round(kg_raw,2)}kg @ {when_utc.isoformat()} "
+                    f"({_epoch_ms(when_utc)}) - {e}"
                 )
                 failed += 1
             except Exception as e:
                 print(
-                    f"[INFO] [FAIL] {when_utc.date()} {kg}kg @ {when_utc.isoformat()} "
+                    f"[INFO] [FAIL] {when_utc.date()} {round(kg_raw,2)}kg @ {when_utc.isoformat()} "
                     f"({_epoch_ms(when_utc)}) - {e}"
                 )
                 failed += 1
@@ -228,7 +215,6 @@ def main() -> int:
             traceback.print_exc()
 
     print(f"[INFO] Done. success={success}, failed={failed}")
-    # 실패가 있어도 CI 전체 실패로 보지 않도록 0 반환(원하면 1로 바꾸세요)
     return 0
 
 
