@@ -2,7 +2,7 @@
 """
 Garmin Weight Uploader
 - 작업 디렉토리의 *.csv 중 가장 최신 파일 자동 선택
-- '날짜' + '시간' → UTC timestamp 생성 후 가민 업로드
+- '날짜' + '시간' → UTC timestamp 생성 후 가민 커넥트에 업로드
 - 필수 컬럼: 날짜, 몸무게
 - 선택 컬럼: 시간
 """
@@ -48,77 +48,4 @@ def read_csv_safely(path: Path) -> pd.DataFrame:
     sys.exit(1)
 
 def pick_latest_csv() -> Path:
-    candidates = sorted(Path(".").glob("*.csv"))
-    if not candidates:
-        print("[ERROR] 작업 디렉토리에 *.csv 없음")
-        sys.exit(1)
-    latest = max(candidates, key=lambda p: p.stat().st_mtime)
-    print(f"[INFO] 선택된 CSV: {latest}")
-    return latest
-
-def ensure_deps():
-    for dep in ("garminconnect", "pytz", "dateutil", "pandas"):
-        try:
-            __import__(dep)
-        except ImportError:
-            print(f"[ERROR] {dep} 미설치")
-            sys.exit(1)
-
-def main():
-    ensure_deps()
-    from garminconnect import Garmin
-
-    email = os.getenv("GARMIN_EMAIL")
-    password = os.getenv("GARMIN_PASSWORD")
-    if not email or not password:
-        print("[WARN] GARMIN_EMAIL / GARMIN_PASSWORD 미설정")
-
-    dry_run = os.getenv("DRY_RUN", "0") == "1"
-
-    csv_path = pick_latest_csv()
-    df = read_csv_safely(csv_path)
-
-    for col in (DATE_COL, WEIGHT_COL):
-        if col not in df.columns:
-            print(f"[ERROR] 필수 컬럼 누락: {col}, CSV 보유 컬럼: {list(df.columns)}")
-            sys.exit(1)
-
-    g = Garmin(email, password)
-    g.login()
-
-    success, failed = 0, 0
-
-    for idx, row in df.iterrows():
-        ts_utc = parse_ts(row.get(DATE_COL), row.get(TIME_COL) if TIME_COL in df.columns else None)
-        weight = to_float(row.get(WEIGHT_COL))
-
-        if ts_utc is None or weight is None:
-            print(f"[SKIP] {idx}: ts/weight 누락")
-            failed += 1
-            continue
-
-        if dry_run:
-            print(f"[DRY] {idx}: {ts_utc.isoformat()}, {weight}")
-            success += 1
-            continue
-
-        try:
-            if hasattr(g, "add_weigh_in_with_timestamps"):
-                g.add_weigh_in_with_timestamps(
-                    weight=weight,
-                    bmi=None,
-                    timestamp=ts_utc.isoformat(timespec="milliseconds")
-                )
-            else:
-                g.add_weigh_in(weight=weight, bmi=None)
-
-            print(f"[OK] {idx}: {ts_utc.isoformat()} UTC, {weight}kg")
-            success += 1
-        except Exception as e:
-            print(f"[FAIL] {idx}: {e}")
-            failed += 1
-
-    print(f"Done. success={success}, failed={failed}")
-
-if __name__ == "__main__":
-    main()
+    candidates = sorted(Path(".").glob("*.*
