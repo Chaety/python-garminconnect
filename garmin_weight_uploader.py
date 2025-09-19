@@ -50,16 +50,10 @@ def read_csv_safely(path: Path) -> pd.DataFrame:
     sys.exit(1)
 
 def pick_latest_csv() -> Path:
-    # 작업 디렉토리 내 CSV 후보를 모두 나열하고 최신 1개 선택
     candidates = sorted(Path(".").glob("*.csv"))
     if not candidates:
         print("[ERROR] 작업 디렉토리에 *.csv 없음")
         sys.exit(1)
-    for p in candidates:
-        try:
-            print(f"[CANDIDATE] {p} (mtime={p.stat().st_mtime})")
-        except Exception:
-            pass
     latest = max(candidates, key=lambda p: p.stat().st_mtime)
     print(f"[INFO] 선택된 CSV: {latest}")
     return latest
@@ -112,9 +106,21 @@ def main():
             continue
 
         try:
-            # 일부 버전은 timestamp만 허용, 일부는 아예 timestamp 인자 미지원 → 둘 다 케어
+            # 가변 시그니처 대응: 가능한 경우 timestamp 포함, 아니면 weight만
             if hasattr(g, "add_weigh_in_with_timestamps"):
                 try:
-                    g.add_weigh_in_with_timestamps(weight=weight, timestamp=ts_utc.isoformat(timespec="milliseconds"))
+                    g.add_weigh_in_with_timestamps(
+                        weight=weight,
+                        timestamp=ts_utc.isoformat(timespec="milliseconds")
+                    )
                 except TypeError:
-                    # 시그니처 차이로 실패하면 weight만 업로드
+                    # timestamp 키워드 미지원 버전
+                    g.add_weigh_in(weight=weight)
+            else:
+                g.add_weigh_in(weight=weight)
+
+            print(f"[OK] {idx}: {ts_utc.isoformat()} UTC, {weight}kg")
+            success += 1
+
+        except Exception as e:
+            print(f"[FAIL] {idx}: {e}
