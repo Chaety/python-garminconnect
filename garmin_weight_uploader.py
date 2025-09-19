@@ -6,8 +6,8 @@ garmin_weight_uploader.py
 
 - Google Drive / Google Fit에서 내려받은 한국어 CSV(예: "무게 2025.09.18 Google Fit.csv")를 읽어
   가민 커넥트에 과거 시각 포함해 체중을 업로드합니다.
-- garth 세션의 connectapi()를 반드시 **호출**해서 requests.Session 을 받아 사용합니다.
-  (수정 포인트: sess = client.connectapi()  ← 기존의 함수 레퍼런스 사용으로 인한 AttributeError 수정)
+- **수정 사항**: garth.Client.connectapi()는 세션이 아니라 엔드포인트 호출 메서드였습니다.
+  인증된 requests.Session 은 client.session 으로 가져와 사용합니다.
 - CSV 파싱은 다음을 모두 허용합니다.
   1) '날짜' 컬럼에 "YYYY.MM.DD HH:MM:SS"가 들어있는 형태
   2) '날짜'는 날짜만, '시간'에 HH:MM:SS가 들어있는 형태
@@ -44,7 +44,6 @@ import garth
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # 가민 커넥트 Weight 업로드 엔드포인트
-# (리포 내 기존 상수명 유지: WEIGHT_POST_URL)
 WEIGHT_POST_URL = (
     "https://connect.garmin.com/modern/proxy/userprofile-service/userprofile/userprofile/weight"
 )
@@ -58,7 +57,6 @@ COL_WEIGHT = "몸무게"
 UNIT_KEY = "kg"
 
 # 과거 시각 업로드 시 타임존: CSV가 현지(예: Asia/Seoul) 기준이라면 해당 타임존을 지정
-# 명시가 없다면 시스템 로컬을 사용하고, 실패 시 Asia/Seoul 로 폴백
 LOCAL_TZ_CANDIDATES = [
     os.getenv("LOCAL_TZ", "").strip(),
     tz.tzlocal(),
@@ -83,7 +81,6 @@ def _first_valid_tz() -> tz.tzfile | tz.tzlocal:
     for cand in LOCAL_TZ_CANDIDATES:
         if cand:
             return cand
-    # 최후 폴백
     return tz.gettz("UTC")
 
 
@@ -133,17 +130,12 @@ def _parse_datetime_kr(date_cell: str, time_cell: Optional[str]) -> Tuple[dateti
     date_cell = (str(date_cell) if date_cell is not None else "").strip()
     time_cell = (str(time_cell) if time_cell is not None else "").strip()
 
-    # 1) 날짜 칸에 이미 시간까지 들어있는 경우 먼저 시도
-    #    포맷 후보들을 순차 시도
     dt_str_candidates = []
-    # date_cell 자체가 datetime 포함
     if any(sep in date_cell for sep in [":"]):
         dt_str_candidates.append(date_cell)
-    # date + time 결합 (공백 구분)
     if date_cell and time_cell and ":" in time_cell and ":" not in date_cell:
         dt_str_candidates.append(f"{date_cell} {time_cell}")
 
-    # 포맷 후보
     fmts = [
         "%Y.%m.%d %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -153,7 +145,6 @@ def _parse_datetime_kr(date_cell: str, time_cell: Optional[str]) -> Tuple[dateti
         "%Y/%m/%d %H:%M",
     ]
 
-    # 2) 시도
     dt_local = None
     for s in (c for c in dt_str_candidates if c):
         for fmt in fmts:
@@ -166,9 +157,7 @@ def _parse_datetime_kr(date_cell: str, time_cell: Optional[str]) -> Tuple[dateti
         if dt_local:
             break
 
-    # 3) 여전히 실패하면 날짜만/시간만 케이스를 다시 조합
     if dt_local is None:
-        # 날짜 파싱
         date_fmts = ["%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d"]
         d_only = None
         for fmt in date_fmts:
@@ -177,7 +166,7 @@ def _parse_datetime_kr(date_cell: str, time_cell: Optional[str]) -> Tuple[dateti
                 break
             except ValueError:
                 continue
-        # 시간 파싱
+
         t_only = None
         if time_cell:
             time_fmts = ["%H:%M:%S", "%H:%M"]
@@ -204,7 +193,6 @@ def _parse_datetime_kr(date_cell: str, time_cell: Optional[str]) -> Tuple[dateti
             dt_local = dt_naive.replace(tzinfo=LOCAL_TZ)
 
     if dt_local is None:
-        # 원본 문자열을 보존해 디버깅 용이
         raise ValueError(f"날짜/시간 파싱 실패: date='{date_cell}', time='{time_cell}'")
 
     date_str = dt_local.strftime("%Y-%m-%d")
@@ -245,19 +233,12 @@ class WeightRow:
 def _row_from_series(row: pd.Series) -> Optional[WeightRow]:
     """CSV 한 행 → WeightRow. 파싱 실패/무게 없음이면 None."""
     try:
-        # 컬럼명 정규화: 공백 제거
         s = {k.strip(): row[k] for k in row.index}
-
-        # 날짜/시간 파싱
         dt_local, date_str = _parse_datetime_kr(s.get(COL_DATE), s.get(COL_TIME))
-
-        # 무게
         weight = _to_float_safe(s.get(COL_WEIGHT))
         if weight is None or weight <= 0:
             return None
-
         return WeightRow(dt_local=dt_local, date_str=date_str, weight_kg=weight)
-
     except Exception as e:
         logger.info("[SKIP] row %s: 파싱 실패 - %s", getattr(row, "name", "?"), e)
         return None
@@ -287,16 +268,13 @@ def _build_payload(w: WeightRow) -> dict:
         "date": w.date_str,
         "unitKey": UNIT_KEY,
         "weight": round(w.weight_kg, 3),
-        # 필요한 경우 아래 확장 필드를 함께 넣을 수 있음
-        # "sourceType": "user",           # 또는 "SCALE"
-        # "suppressNotification": False,
     }
 
 
 def login_and_session() -> Tuple[garth.Client, object]:
     """
-    garth로 로그인 후 requests.Session 반환.
-    중요: connectapi **호출** 필요.
+    garth로 로그인 후 **인증된 requests.Session** 반환.
+    중요: 세션은 client.session 으로 가져옵니다.
     """
     email = os.environ.get("GARMIN_EMAIL", "").strip()
     password = os.environ.get("GARMIN_PASSWORD", "").strip()
@@ -306,9 +284,13 @@ def login_and_session() -> Tuple[garth.Client, object]:
     client = garth.Client()
     client.login(email, password)
 
-    # **** 핵심 수정 포인트 ****
-    sess = client.connectapi()  # ← 호출해서 Session을 받는다
-    # ***************************
+    # 인증된 세션
+    sess = client.session  # ← 핵심 수정
+
+    # 가민이 기대하는 헤더 일부가 비어있을 경우 보강(무해)
+    sess.headers.setdefault("Origin", "https://connect.garmin.com")
+    sess.headers.setdefault("Referer", "https://connect.garmin.com/")
+    sess.headers.setdefault("Accept", "application/json, text/plain, */*")
 
     logger.info("Garmin login OK")
     return client, sess
@@ -330,17 +312,18 @@ def main():
         payload = _build_payload(w)
         try:
             res = _post_with_retries(sess, WEIGHT_POST_URL, payload)
-            # 일부 엔드포인트는 body 없이 204/201 등 반환
             logger.debug("POST OK %s", getattr(res, "status_code", "?"))
             success += 1
         except Exception as e:
             failed += 1
-            logger.info("[FAIL] %s %.3fkg @ %s (%s) - %s",
-                        w.date_str,
-                        w.weight_kg,
-                        w.dt_local.isoformat(),
-                        payload.get("timestampGMT"),
-                        e)
+            logger.info(
+                "[FAIL] %s %.3fkg @ %s (%s) - %s",
+                w.date_str,
+                w.weight_kg,
+                w.dt_local.isoformat(),
+                payload.get("timestampGMT"),
+                e,
+            )
 
     logger.info("Done. success=%d, failed=%d", success, failed)
 
@@ -349,6 +332,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # 트레이스 요약 출력(액션 로그 가독성)
         logger.exception(e)
         raise
