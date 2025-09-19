@@ -1,4 +1,3 @@
 garminconnect==0.2.13
 pandas
-pytz
 python-dateutil
