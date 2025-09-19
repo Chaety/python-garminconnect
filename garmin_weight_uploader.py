@@ -91,30 +91,33 @@ def main():
 
     for idx, row in df.iterrows():
         ts_utc = parse_ts(row.get(DATE_COL), row.get(TIME_COL) if TIME_COL in df.columns else None)
-        weight_kg = to_float(row.get(WEIGHT_COL))
+        weight = to_float(row.get(WEIGHT_COL))  # ← 변수명 weight
         fat = to_float(row.get(FAT_COL)) if FAT_COL in df.columns else None
 
-        if ts_utc is None or weight_kg is None:
+        if ts_utc is None or weight is None:
             print(f"[SKIP] {idx}: ts/weight 누락")
             failed += 1
             continue
 
         if dry_run:
-            print(f"[DRY] {idx}: {ts_utc.isoformat()}, {weight_kg}, {fat}")
+            print(f"[DRY] {idx}: {ts_utc.isoformat()}, {weight}, {fat}")
             success += 1
             continue
 
         try:
+            # 최신 버전: add_weigh_in_with_timestamps(weight=..., percent_fat=..., bmi=..., timestamp=...)
             if hasattr(g, "add_weigh_in_with_timestamps"):
                 g.add_weigh_in_with_timestamps(
-                    weight_kg=weight_kg,
+                    weight=weight,
                     percent_fat=fat,
                     bmi=None,
                     timestamp=ts_utc.isoformat(timespec="milliseconds")
                 )
             else:
-                g.add_weigh_in(weight_kg=weight_kg, percent_fat=fat, bmi=None)
-            print(f"[OK] {idx}: {ts_utc.isoformat()} UTC, {weight_kg}kg, fat={fat}")
+                # 구버전: add_weigh_in(weight=..., percent_fat=..., bmi=...)
+                g.add_weigh_in(weight=weight, percent_fat=fat, bmi=None)
+
+            print(f"[OK] {idx}: {ts_utc.isoformat()} UTC, {weight}kg, fat={fat}")
             success += 1
         except Exception as e:
             print(f"[FAIL] {idx}: {e}")
