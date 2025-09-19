@@ -1,171 +1,104 @@
-#!/usr/bin/env python3
-# garmin_weight_uploader.py
-# - Google Drive에서 받은 CSV(예: "무게 YYYY.MM.DD Google Fit.csv")를 읽어
-#   날짜별 마지막 유효 몸무게만 Garmin Connect에 업로드합니다.
-# - garth 0.5.x 기준: 세션/쿠키는 garth가 내부에서 관리하며,
-#   API 호출은 garth.connectapi()로 수행합니다.
-
+# --- 새 유틸 함수들 ----------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+import csv
 import os
-import sys
-import glob
-import json
-from datetime import datetime
-from typing import List, Tuple, Optional
+import re
 
-import pandas as pd
-import garth
+KOR_COLS = {
+    "date": "날짜",
+    "time": "시간",
+    "weight": "몸무게",
+}
 
+ISO = "%Y-%m-%d"
 
-TOKEN_DIR = os.path.expanduser("~/.garminconnect")  # actions/cache와 동일 경로 사용
-WEIGHT_POST_PATH = "weight-service/user-weight"     # modern/proxy/ 접두사는 garth가 알아서 붙임
-
-
-def ensure_login(email: str, password: str, token_dir: str = TOKEN_DIR) -> None:
+def _parse_csv_daily_avg(csv_path: str) -> dict[str, float]:
     """
-    garth 토큰을 복구(resume)하거나, 없으면 로그인 후 저장(save).
-    MFA가 설정돼 있으면 garth가 프롬프트로 코드를 받습니다.
+    CSV에서 같은 '날짜'별로 몸무게 평균을 계산해 { 'YYYY-MM-DD': 평균(kg) } 반환.
     """
-    try:
-        garth.resume(token_dir)
-        _ = garth.client.username  # 토큰 유효성 확인
-        print(f"[INFO] Logged in as: {garth.client.username}")
-        return
-    except FileNotFoundError:
-        print("[INFO] No saved tokens. Will login fresh...")
-    except Exception as e:
-        print(f"[WARN] Resume failed ({e}). Will login fresh...")
+    by_day = defaultdict(list)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        for row in rdr:
+            # 날짜 칸은 '2025.09.18 00:00:00' 형식 → 앞의 날짜만 사용
+            raw = row.get(KOR_COLS["date"]) or ""
+            m = re.match(r"(\d{4})\.(\d{2})\.(\d{2})", raw)
+            if not m:
+                continue
+            day = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
-    garth.login(email, password)
-    garth.save(token_dir)
-    print(f"[INFO] Login success. Saved tokens to {token_dir}. User: {garth.client.username}")
-
-
-def find_latest_csv(patterns: List[str]) -> Optional[str]:
-    """
-    지정 패턴 목록 중 가장 최근 mtime의 파일을 반환.
-    """
-    candidates: List[Tuple[float, str]] = []
-    for pat in patterns:
-        for path in glob.glob(pat):
+            w = (row.get(KOR_COLS["weight"]) or "").replace('"', "")
             try:
-                candidates.append((os.path.getmtime(path), path))
-            except OSError:
-                pass
-    if not candidates:
-        return None
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    return candidates[0][1]
+                kg = float(w)
+            except ValueError:
+                continue
+            if kg <= 0:
+                continue
+
+            by_day[day].append(kg)
+
+    # 평균 내기
+    daily_avg = {}
+    for day, vals in by_day.items():
+        daily_avg[day] = round(sum(vals) / len(vals), 2)
+    return daily_avg
 
 
-def load_weight_rows(csv_path: str) -> pd.DataFrame:
+def _get_existing_dates(garth, start: str, end: str) -> set[str]:
     """
-    한국어 헤더의 CSV를 읽어 필요한 컬럼을 표준화.
-    예상 헤더:
-      날짜,시간,몸무게,체지방률,체지방량,무지방 비율,무지방 질량,골격근 비율,골격근량,근육량 비율,근육량,골량,총 체수분,기본 대사율
+    지정 구간에 이미 가민에 저장된 체중 기록이 있는 날짜(YYYY-MM-DD) 집합을 반환.
+    가민 Connect 내부 API는 문서화가 약해서, 가장 호환성 높은 dateRange 엔드포인트를 사용.
     """
-    print(f"[INFO] Selected CSV: {csv_path}")
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
-
-    for req in ["날짜", "시간", "몸무게"]:
-        if req not in df.columns:
-            raise ValueError(f"CSV에 '{req}' 컬럼이 없습니다.")
-
-    def parse_date(s: str) -> datetime.date:
-        s = str(s).strip().split()[0]  # 'YYYY.MM.DD HH:MM:SS' -> 날짜만
-        return datetime.strptime(s, "%Y.%m.%d").date()
-
-    def parse_time(s: str) -> datetime.time:
-        s = str(s).strip()
-        return datetime.strptime(s, "%H:%M:%S").time()
-
-    rows = []
-    for _, row in df.iterrows():
-        try:
-            d = parse_date(row["날짜"])
-        except Exception:
-            d = parse_date(str(row["날짜"]).split()[0])
-        try:
-            t = parse_time(row["시간"])
-        except Exception:
-            t = datetime.strptime("00:00:00", "%H:%M:%S").time()
-        try:
-            w = float(str(row["몸무게"]).replace('"', '').strip())
-        except Exception:
-            w = 0.0
-        if w > 0:
-            rows.append((d, t, w))
-
-    if not rows:
-        raise ValueError("유효한(>0) 몸무게 값이 없습니다.")
-
-    out = pd.DataFrame(rows, columns=["date", "time", "weight_kg"])
-    return out
+    path = f"weight-service/weight/dateRange?startDate={start}&endDate={end}"
+    data = garth.connectapi(path, None, method="GET") or []
+    # 응답 예시는 [{"date":"2025-09-18","weight":69.2, ...}, ...] 형태가 흔함
+    existing = set()
+    for item in data:
+        d = item.get("date") or item.get("calendarDate")
+        if d:
+            existing.add(d[:10])
+    return existing
 
 
-def pick_last_per_date(df: pd.DataFrame) -> pd.DataFrame:
-    """동일 날짜에서 가장 늦은 시간(최신 측정)만 선택"""
-    df_sorted = df.sort_values(["date", "time"])
-    last_rows = df_sorted.groupby("date", as_index=False).tail(1)
-    return last_rows.sort_values("date")
-
-
-def post_weight(date_str: str, kg: float) -> dict:
+def _post_weight(garth, day: str, kg: float):
     """
-    가민 Connect Weight API로 업로드.
-    path: weight-service/user-weight  (garth가 modern/proxy/ 접두사를 처리)
-    payload: {"value": <kg>, "unitKey": "kg", "date": "YYYY-MM-DD"}
+    시간 없이 날짜/무게만 업로드 (표시는 00:00로 보임이 정상).
     """
     payload = {
-        "value": round(float(kg), 3),
+        "date": day,
+        "weight": kg,
         "unitKey": "kg",
-        "date": date_str,
     }
-    resp = garth.connectapi(
-        WEIGHT_POST_PATH,
-        method="POST",
-        json=payload,
-    )
-    return resp
+    # 공식 앱과 동일 경로 (No Content면 None 반환)
+    return garth.connectapi("weight-service/user-weight", payload, method="POST")
 
 
-def main():
-    email = os.getenv("GARMIN_EMAIL")
-    password = os.getenv("GARMIN_PASSWORD")
-    if not email or not password:
-        print("[ERROR] 환경변수 GARMIN_EMAIL/GARMIN_PASSWORD 가 필요합니다.", file=sys.stderr)
-        sys.exit(2)
+# --- 메인 처리 흐름(평균 & 중복 방지) -----------------------------------------
+def run_upload(csv_path: str, garth):
+    daily_avg = _parse_csv_daily_avg(csv_path)
+    if not daily_avg:
+        print("[INFO] CSV에서 업로드 후보를 찾지 못했습니다.")
+        return
 
-    ensure_login(email, password, TOKEN_DIR)
+    start = min(daily_avg.keys())
+    end   = max(daily_avg.keys())
 
-    csv_path = find_latest_csv([
-        "*Google Fit.csv",
-        "*.csv",
-    ])
-    if not csv_path:
-        print("[ERROR] 작업 폴더에서 CSV를 찾지 못했습니다.", file=sys.stderr)
-        sys.exit(3)
+    existing = _get_existing_dates(garth, start, end)
+    print("[INFO] 업로드 후보(평균):")
+    for d in sorted(daily_avg.keys()):
+        mark = "(이미 있음)" if d in existing else ""
+        print(f"  - {d}  {daily_avg[d]} kg {mark}")
 
-    df = load_weight_rows(csv_path)
-    target = pick_last_per_date(df)
+    uploaded = 0
+    skipped  = 0
+    for d in sorted(daily_avg.keys()):
+        if d in existing:
+            print(f"[SKIP] {d} 이미 등록되어 있어 건너뜁니다.")
+            skipped += 1
+            continue
+        resp = _post_weight(garth, d, daily_avg[d])
+        print(f"[OK] {d} -> {daily_avg[d]} kg  resp: {resp!r}")
+        uploaded += 1
 
-    print("[INFO] Upload candidates:")
-    for _, r in target.iterrows():
-        print(f"  - {r['date'].isoformat()}  {r['time']}  {r['weight_kg']} kg")
-
-    failures = 0
-    for _, r in target.iterrows():
-        date_str = r["date"].isoformat()
-        kg = float(r["weight_kg"])
-        try:
-            resp = post_weight(date_str, kg)
-            print(f"[OK] {date_str} -> {kg} kg  resp: {json.dumps(resp)[:200]}...")
-        except Exception as e:
-            failures += 1
-            print(f"[FAIL] {date_str} -> {kg} kg  ({e})", file=sys.stderr)
-
-    if failures:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    print(f"[SUMMARY] 업로드 {uploaded}건, 스킵 {skipped}건")
