@@ -28,9 +28,26 @@ jobs:
         run: |
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
+      # ✅ Heredoc으로 서비스 계정 JSON을 안전하게 작성
       - name: Write service account JSON
+        shell: bash
         run: |
-          echo "${{ secrets.GDRIVE_SA_JSON }}" > sa.json
+          cat > sa.json <<'JSON'
+          ${{ secrets.GDRIVE_SA_JSON }}
+          JSON
+
+      # ✅ JSON 구조 검증
+      - name: Validate service account JSON (quick)
+        run: |
+          head -c 1 sa.json | grep '{' >/dev/null || (echo "sa.json is not starting with {" && exit 1)
+
+      - name: Validate JSON with Python
+        run: |
+          python - <<'PY'
+          import json
+          json.load(open('sa.json','r', encoding='utf-8'))
+          print("JSON OK")
+          PY
 
       - name: Create rclone config for Drive (service account)
         run: |
