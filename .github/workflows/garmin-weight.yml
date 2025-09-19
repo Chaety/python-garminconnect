@@ -56,8 +56,6 @@ jobs:
           type = drive
           scope = drive.readonly
           service_account_file = sa.json
-          team_drive =
-          root_folder_id =
           EOF
 
       - name: Download latest CSV from Drive folder
@@ -65,8 +63,8 @@ jobs:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          # List files (path + modtime), filter CSV, sort by time, pick latest
-          rclone lsf "gdrive:{${FOLDER_ID}}" --files-only --format "pt" --recursive \
+          # 최신 CSV 선택
+          rclone lsf "gdrive:$FOLDER_ID" --files-only --format "pt" --recursive \
             | grep -E '\.csv$' \
             | sort -k2 \
             | tail -n 1 \
@@ -79,7 +77,7 @@ jobs:
 
           LATEST_FILE=$(cat latest.txt)
           echo "Latest CSV in Drive: $LATEST_FILE"
-          rclone copy "gdrive:{${FOLDER_ID}}/$LATEST_FILE" . --progress
+          rclone copy "gdrive:$FOLDER_ID/$LATEST_FILE" . --progress
 
           echo "Downloaded:"
           ls -al "무게 "*.csv || true
