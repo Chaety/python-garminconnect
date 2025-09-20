@@ -4,11 +4,12 @@
 """
 garmin_weight_uploader.py
 
-- 구글드라이브에서 동기화된 CSV/FIT 전체 레코드를 읽어
-  Garmin Connect에 체중만 업로드.
+- 구글드라이브 동기화된 CSV/FIT 파일 전체에서 체중만 읽어
+  Garmin Connect에 업로드
 - 날짜: MM/DD/YYYY
 - 시간: h:mm am/pm (소문자, 초 없음)
 - 중복: (날짜, 시간, 체중) 기준으로 스킵
+- 엔드포인트: proxy/wellness-service/user-weight
 """
 
 import os
@@ -77,26 +78,24 @@ def parse_csv(path: str) -> List[WeightRecord]:
         if w is None:
             continue
 
-        dt_obj: Optional[datetime] = None
         dval, tval = str(row.get(col_date, "")).strip(), str(row.get(col_time, "")).strip()
+        dt_obj: Optional[datetime] = None
 
         # case1: 날짜 안에 시각까지 같이 있음
         if re.match(r"^\d{4}[./-]\d{2}[./-]\d{2} \d{2}:\d{2}:\d{2}$", dval):
-            try:
-                dt_obj = datetime.strptime(dval, "%Y.%m.%d %H:%M:%S")
-            except Exception:
+            for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
                 try:
-                    dt_obj = datetime.strptime(dval, "%Y-%m-%d %H:%M:%S")
+                    dt_obj = datetime.strptime(dval, fmt)
+                    break
                 except Exception:
                     pass
 
         # case2: 날짜 + 시간 따로
         if not dt_obj and dval and tval:
-            try:
-                dt_obj = datetime.strptime(f"{dval} {tval}", "%Y.%m.%d %H:%M:%S")
-            except Exception:
+            for fmt in ("%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M"):
                 try:
-                    dt_obj = datetime.strptime(f"{dval} {tval}", "%Y.%m.%d %H:%M")
+                    dt_obj = datetime.strptime(f"{dval} {tval}", fmt)
+                    break
                 except Exception:
                     pass
 
@@ -154,10 +153,12 @@ def upload_weight(rec: WeightRecord) -> bool:
         "time": rec.time_str(),
     }
     try:
-        r = garth.client.post("connectapi", "proxy/weight-service/user-weight", json=payload)
+        r = garth.client.post("connectapi", "proxy/wellness-service/user-weight", json=payload)
         if r.status_code in (200, 201, 204):
             print(f"[OK] {rec.date_str()} {rec.time_str()} {rec.weight_kg}kg 업로드")
             return True
+        else:
+            print(f"[FAIL] {rec.date_str()} {rec.time_str()} status={r.status_code} body={r.text[:200]}")
     except Exception as e:
         print(f"[ERR] 업로드 실패: {e}")
     return False
