@@ -3,7 +3,10 @@ name: Garmin Weight Uploader (Drive → Garmin)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 21 * * *"   # 매일 KST 06:30 (UTC 21:30)
+    # 매일 오전 0시 (KST)
+    - cron: "0 15 * * *"
+    # 매일 오후 12시 (KST)
+    - cron: "0 3 * * *"
 
 jobs:
   run:
