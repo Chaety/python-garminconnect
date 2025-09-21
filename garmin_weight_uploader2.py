@@ -6,6 +6,8 @@ garmin_weight_uploader.py
 
 - Google Fit CSV 전체를 읽어 Garmin Connect에 업로드
 - Asia/Seoul 타임존 반영
+- BMI 자동 계산 (신장 174.8cm 고정)
+- 골격근량(skeletal_muscle_mass) 지원
 - 중복 제거: (날짜+시간+체중) 기준
 """
 
@@ -34,9 +36,13 @@ HEADER_MAP = {
     "총 체수분": "percent_hydration",
     "골량": "bone_mass",
     "근육량": "muscle_mass",
+    "골격근량": "skeletal_muscle_mass",
     "기본 대사율": "basal_met",
     "BMI": "bmi",
 }
+
+# 신장 고정 (cm)
+FIXED_HEIGHT_CM = 174.8
 
 
 @dataclass
@@ -49,6 +55,7 @@ class BodyRow:
     percent_hydration: Optional[float] = None
     bone_mass: Optional[float] = None
     muscle_mass: Optional[float] = None
+    skeletal_muscle_mass: Optional[float] = None
     basal_met: Optional[float] = None
     bmi: Optional[float] = None
 
@@ -86,6 +93,12 @@ def _rename_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=new_cols)
 
 
+def _calc_bmi(weight: float) -> float:
+    """BMI = weight(kg) / (height(m)^2), 신장 174.8cm 고정"""
+    height_m = FIXED_HEIGHT_CM / 100.0
+    return round(weight / (height_m ** 2), 1)
+
+
 def load_rows_from_csv(path: str) -> list[BodyRow]:
     df = pd.read_csv(path)
     df = _rename_headers(df)
@@ -102,6 +115,8 @@ def load_rows_from_csv(path: str) -> list[BodyRow]:
         if weight is None:
             continue
 
+        bmi_val = _calc_bmi(weight)
+
         date_s = dt_obj.strftime("%m/%d/%Y")
         time_s = dt_obj.strftime("%I:%M %p").lower().lstrip("0")
 
@@ -115,8 +130,9 @@ def load_rows_from_csv(path: str) -> list[BodyRow]:
                 percent_hydration=_coerce_float(r.get("percent_hydration")),
                 bone_mass=_coerce_float(r.get("bone_mass")),
                 muscle_mass=_coerce_float(r.get("muscle_mass")),
+                skeletal_muscle_mass=_coerce_float(r.get("skeletal_muscle_mass")),
                 basal_met=_coerce_float(r.get("basal_met")),
-                bmi=_coerce_float(r.get("bmi")),
+                bmi=bmi_val,
             )
         )
     return rows
