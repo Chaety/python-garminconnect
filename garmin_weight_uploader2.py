@@ -1,104 +1,201 @@
-# --- 새 유틸 함수들 ----------------------------------------------------------
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-import csv
-import os
-import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-KOR_COLS = {
-    "date": "날짜",
-    "time": "시간",
-    "weight": "몸무게",
+"""
+garmin_weight_uploader.py
+
+- Google Fit CSV 전체를 읽어 Garmin Connect에 업로드
+- Asia/Seoul 타임존 반영
+- 중복 제거: (날짜+시간+체중) 기준
+"""
+
+import argparse
+import glob
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Set, Tuple
+
+import pandas as pd
+from dateutil import parser as dtparser
+from zoneinfo import ZoneInfo
+from garminconnect import Garmin
+
+
+TOKEN_DIR = os.path.expanduser("~/.garminconnect")
+
+HEADER_MAP = {
+    "날짜": "date",
+    "시간": "time",
+    "몸무게": "weight",
+    "체지방률": "percent_fat",
+    "총 체수분": "percent_hydration",
+    "골량": "bone_mass",
+    "근육량": "muscle_mass",
+    "기본 대사율": "basal_met",
+    "BMI": "bmi",
 }
 
-ISO = "%Y-%m-%d"
 
-def _parse_csv_daily_avg(csv_path: str) -> dict[str, float]:
-    """
-    CSV에서 같은 '날짜'별로 몸무게 평균을 계산해 { 'YYYY-MM-DD': 평균(kg) } 반환.
-    """
-    by_day = defaultdict(list)
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        for row in rdr:
-            # 날짜 칸은 '2025.09.18 00:00:00' 형식 → 앞의 날짜만 사용
-            raw = row.get(KOR_COLS["date"]) or ""
-            m = re.match(r"(\d{4})\.(\d{2})\.(\d{2})", raw)
-            if not m:
-                continue
-            day = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+@dataclass
+class BodyRow:
+    ts_iso: str
+    date_str: str
+    time_str: str
+    weight: float
+    percent_fat: Optional[float] = None
+    percent_hydration: Optional[float] = None
+    bone_mass: Optional[float] = None
+    muscle_mass: Optional[float] = None
+    basal_met: Optional[float] = None
+    bmi: Optional[float] = None
 
-            w = (row.get(KOR_COLS["weight"]) or "").replace('"', "")
-            try:
-                kg = float(w)
-            except ValueError:
-                continue
-            if kg <= 0:
-                continue
-
-            by_day[day].append(kg)
-
-    # 평균 내기
-    daily_avg = {}
-    for day, vals in by_day.items():
-        daily_avg[day] = round(sum(vals) / len(vals), 2)
-    return daily_avg
+    def dup_key(self) -> Tuple[str, str, float]:
+        return (self.date_str, self.time_str, round(self.weight, 2))
 
 
-def _get_existing_dates(garth, start: str, end: str) -> set[str]:
-    """
-    지정 구간에 이미 가민에 저장된 체중 기록이 있는 날짜(YYYY-MM-DD) 집합을 반환.
-    가민 Connect 내부 API는 문서화가 약해서, 가장 호환성 높은 dateRange 엔드포인트를 사용.
-    """
-    path = f"weight-service/weight/dateRange?startDate={start}&endDate={end}"
-    data = garth.connectapi(path, None, method="GET") or []
-    # 응답 예시는 [{"date":"2025-09-18","weight":69.2, ...}, ...] 형태가 흔함
-    existing = set()
-    for item in data:
-        d = item.get("date") or item.get("calendarDate")
-        if d:
-            existing.add(d[:10])
-    return existing
+def _coerce_float(x) -> Optional[float]:
+    try:
+        v = float(str(x).strip().replace(",", ".").replace('"', ""))
+        return None if v == 0 else v
+    except Exception:
+        return None
 
 
-def _post_weight(garth, day: str, kg: float):
-    """
-    시간 없이 날짜/무게만 업로드 (표시는 00:00로 보임이 정상).
-    """
-    payload = {
-        "date": day,
-        "weight": kg,
-        "unitKey": "kg",
-    }
-    # 공식 앱과 동일 경로 (No Content면 None 반환)
-    return garth.connectapi("weight-service/user-weight", payload, method="POST")
+def _parse_timestamp(date_str: str, time_str: Optional[str]) -> datetime:
+    s = date_str.strip()
+    if time_str:
+        if " " not in s and "T" not in s:
+            s = f"{s} {time_str.strip()}"
+    s = s.replace(".", "-")
+    dt = dtparser.parse(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    return dt.replace(microsecond=0)
 
 
-# --- 메인 처리 흐름(평균 & 중복 방지) -----------------------------------------
-def run_upload(csv_path: str, garth):
-    daily_avg = _parse_csv_daily_avg(csv_path)
-    if not daily_avg:
-        print("[INFO] CSV에서 업로드 후보를 찾지 못했습니다.")
-        return
+def _rename_headers(df: pd.DataFrame) -> pd.DataFrame:
+    new_cols = {}
+    for c in df.columns:
+        if c in HEADER_MAP:
+            new_cols[c] = HEADER_MAP[c]
+        else:
+            new_cols[c] = c.lower()
+    return df.rename(columns=new_cols)
 
-    start = min(daily_avg.keys())	
-    end   = max(daily_avg.keys())
 
-    existing = _get_existing_dates(garth, start, end)
-    print("[INFO] 업로드 후보(평균):")
-    for d in sorted(daily_avg.keys()):
-        mark = "(이미 있음)" if d in existing else ""
-        print(f"  - {d}  {daily_avg[d]} kg {mark}")
+def load_rows_from_csv(path: str) -> list[BodyRow]:
+    df = pd.read_csv(path)
+    df = _rename_headers(df)
+    if "date" not in df or "weight" not in df:
+        return []
 
-    uploaded = 0
-    skipped  = 0
-    for d in sorted(daily_avg.keys()):
-        if d in existing:
-            print(f"[SKIP] {d} 이미 등록되어 있어 건너뜁니다.")
-            skipped += 1
+    rows: list[BodyRow] = []
+    for _, r in df.iterrows():
+        date_val = str(r.get("date", "")).strip()
+        time_val = str(r.get("time", "")).strip() if "time" in df else ""
+        dt_obj = _parse_timestamp(date_val, time_val if time_val else None)
+
+        weight = _coerce_float(r.get("weight"))
+        if weight is None:
             continue
-        resp = _post_weight(garth, d, daily_avg[d])
-        print(f"[OK] {d} -> {daily_avg[d]} kg  resp: {resp!r}")
-        uploaded += 1
 
-    print(f"[SUMMARY] 업로드 {uploaded}건, 스킵 {skipped}건")
+        date_s = dt_obj.strftime("%m/%d/%Y")
+        time_s = dt_obj.strftime("%I:%M %p").lower().lstrip("0")
+
+        rows.append(
+            BodyRow(
+                ts_iso=dt_obj.isoformat(),
+                date_str=date_s,
+                time_str=time_s,
+                weight=weight,
+                percent_fat=_coerce_float(r.get("percent_fat")),
+                percent_hydration=_coerce_float(r.get("percent_hydration")),
+                bone_mass=_coerce_float(r.get("bone_mass")),
+                muscle_mass=_coerce_float(r.get("muscle_mass")),
+                basal_met=_coerce_float(r.get("basal_met")),
+                bmi=_coerce_float(r.get("bmi")),
+            )
+        )
+    return rows
+
+
+def login(email: Optional[str], password: Optional[str]) -> Garmin:
+    email = email or os.getenv("GARMIN_EMAIL")
+    password = password or os.getenv("GARMIN_PASSWORD")
+    if not email or not password:
+        sys.exit("GARMIN_EMAIL / GARMIN_PASSWORD 필요")
+    api = Garmin(email, password)
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    try:
+        api.login(token_store=TOKEN_DIR)
+    except Exception:
+        api.login()
+        api.garth.dump(TOKEN_DIR)
+    print("✅ Garmin 로그인 성공")
+    return api
+
+
+def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates: bool) -> None:
+    seen: Set[Tuple[str, str, float]] = set()
+    for row in rows:
+        k = row.dup_key()
+        if skip_duplicates and k in seen:
+            print(f"⏭️  {row.ts_iso} {row.weight}kg → 중복 스킵")
+            continue
+        seen.add(k)
+
+        print(f"➡️ {row.ts_iso} {row.weight}kg 업로드 중...")
+        if dry_run:
+            continue
+        try:
+            api.add_body_composition(
+                row.ts_iso,
+                weight=row.weight,
+                percent_fat=row.percent_fat,
+                percent_hydration=row.percent_hydration,
+                bone_mass=row.bone_mass,
+                muscle_mass=row.muscle_mass,
+                basal_met=row.basal_met,
+                bmi=row.bmi,
+            )
+            print("   ✅ 성공")
+        except Exception as e:
+            print(f"   ❌ 실패: {e}")
+        time.sleep(0.3)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--email")
+    ap.add_argument("--password")
+    ap.add_argument("--csv", nargs="*", default=["무게*.csv"], help="CSV 패턴 (기본: 무게*.csv 전체)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-skip-duplicates", action="store_true", help="중복도 강제 업로드")
+    args = ap.parse_args()
+
+    targets: list[str] = []
+    for pat in args.csv:
+        targets.extend(glob.glob(pat))
+    if not targets:
+        sys.exit("CSV 파일을 찾을 수 없습니다.")
+
+    print("📄 처리 대상 CSV:")
+    for t in targets:
+        print(" -", t)
+
+    api = login(args.email, args.password)
+
+    all_rows: list[BodyRow] = []
+    for path in targets:
+        rows = load_rows_from_csv(path)
+        all_rows.extend(rows)
+
+    print(f"총 {len(all_rows)}개 레코드 로드됨")
+    upload_rows(api, all_rows, args.dry_run, skip_duplicates=not args.no_skip_duplicates)
+
+
+if __name__ == "__main__":
+    main()
