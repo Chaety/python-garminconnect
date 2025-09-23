@@ -215,4 +215,94 @@ def login(email: Optional[str], password: Optional[str]) -> Garmin:
     email = email or os.getenv("GARMIN_EMAIL")
     password = password or os.getenv("GARMIN_PASSWORD")
     if not email or not password:
-        sys.exit("GARMI
+        sys.exit("GARMIN_EMAIL / GARMIN_PASSWORD 필요")
+    api = Garmin(email, password)
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    try:
+        api.login(token_store=TOKEN_DIR)
+    except Exception:
+        api.login()
+        api.garth.dump(TOKEN_DIR)
+    print("✅ Garmin 로그인 성공")
+    return api
+
+
+def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates: bool) -> None:
+    # 메모리 내 중복 제거 (같은 실행 내에서 동일 키가 여러 번 나오면 스킵)
+    seen: Set[Tuple[str, str, float]] = set()
+
+    for row in rows:
+        k = row.dup_key()
+        if skip_duplicates and k in seen:
+            print(f"⏭️  {row.date_str_kst} {row.time_str_kst} {row.weight}kg → 중복 스킵")
+            continue
+        seen.add(k)
+
+        # 업로드 로그(선택된 muscle_mass 출처 힌트)
+        mm_src = (
+            "골격근량" if (row.src_skeletal_muscle_mass is not None)
+            else ("근육량" if (row.src_muscle_mass is not None) else "없음")
+        )
+        print(f"➡️ {row.date_str_kst} {row.time_str_kst}  {row.weight}kg  "
+              f"(muscle_mass: {row.muscle_mass} [{mm_src}], BMI: {row.bmi}) 업로드 중... → {row.ts_iso_utc}")
+
+        if dry_run:
+            continue
+
+        try:
+            # None 값은 키 자체를 넣지 않도록 dict를 동적으로 구성
+            payload = {"weight": row.weight}
+            for f in BODY_FIELDS:
+                v = getattr(row, f)
+                if v is not None:
+                    payload[f] = v
+
+            # ← 여기서 UTC(Z)로 변환된 시간을 전송
+            api.add_body_composition(row.ts_iso_utc, **payload)
+            print("   ✅ 성공")
+        except Exception as e:
+            print(f"   ❌ 실패: {e}")
+
+        # 과도한 호출 방지
+        time.sleep(0.3)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 진입점
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--email")
+    ap.add_argument("--password")
+    ap.add_argument("--csv", nargs="*", default=["무게*.csv"], help="CSV 패턴 (기본: 무게*.csv 전체)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-skip-duplicates", action="store_true", help="중복도 강제 업로드")
+    args = ap.parse_args()
+
+    # 업로드 대상 파일 수집
+    targets: list[str] = []
+    for pat in args.csv:
+        targets.extend(glob.glob(pat))
+    if not targets:
+        sys.exit("CSV 파일을 찾을 수 없습니다.")
+
+    print("📄 처리 대상 CSV:")
+    for t in targets:
+        print(" -", t)
+
+    api = login(args.email, args.password)
+
+    # CSV → 레코드 변환
+    all_rows: list[BodyRow] = []
+    for path in targets:
+        rows = load_rows_from_csv(path)
+        all_rows.extend(rows)
+
+    print(f"총 {len(all_rows)}개 레코드 로드됨")
+
+    # 업로드 (기본은 중복 스킵)
+    upload_rows(api, all_rows, args.dry_run, skip_duplicates=not args.no_skip_duplicates)
+
+
+if __name__ == "__main__":
+    main()
