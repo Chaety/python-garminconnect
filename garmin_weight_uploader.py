@@ -216,14 +216,27 @@ def login(email: Optional[str], password: Optional[str]) -> Garmin:
     password = password or os.getenv("GARMIN_PASSWORD")
     if not email or not password:
         sys.exit("GARMIN_EMAIL / GARMIN_PASSWORD 필요")
+
     api = Garmin(email, password)
     os.makedirs(TOKEN_DIR, exist_ok=True)
+
+    # 1) 저장된 토큰으로 복원 시도
     try:
-        api.login(token_store=TOKEN_DIR)
+        api.garth.load(TOKEN_DIR)
+        api.display_name  # 토큰 유효성 확인 (만료 시 예외 발생)
+        print("✅ 토큰 재사용 성공 (로그인 스킵)")
+        return api
     except Exception:
+        pass  # 토큰 없거나 만료 → 새 로그인
+
+    # 2) 새 로그인 후 토큰 저장
+    try:
         api.login()
         api.garth.dump(TOKEN_DIR)
-    print("✅ Garmin 로그인 성공")
+        print("✅ Garmin 새 로그인 성공 (토큰 저장됨)")
+    except Exception as e:
+        sys.exit(f"❌ 로그인 실패: {e}")
+
     return api
 
 
