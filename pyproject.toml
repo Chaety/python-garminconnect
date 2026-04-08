@@ -87,6 +87,15 @@ excludes = [
 [tool.pdm.python]
 path = ".venv/bin/python"
 
+[tool.black]
+line-length = 88
+extend-exclude = '''
+(
+  GWU\.py
+  | demo\.py
+)
+'''
+
 [tool.ruff]
 line-length = 88
 target-version = "py310"
