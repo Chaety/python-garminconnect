@@ -81,7 +81,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.garminconnect
-          key: garmin-token-v1
+          key: garmin-token-v2-${{ github.run_id }}
+          restore-keys: |
+            garmin-token-v2-
 
       - name: Upload to Garmin
         env:
@@ -89,11 +91,11 @@ jobs:
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           # DRY_RUN: "1"   # 필요 시 테스트 모드
         run: |
-          python garmin_weight_uploader.py
+          python GWU.py
 
-      - name: Save Garmin token cache (first run only)
-        if: steps.restore_token.outputs.cache-hit != 'true'
+      - name: Save Garmin token cache
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/.garminconnect
-          key: garmin-token-v1
+          key: garmin-token-v2-${{ github.run_id }}
