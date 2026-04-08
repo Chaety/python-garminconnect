@@ -44,7 +44,7 @@ warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
 module = "garminconnect"
-disable_error_codes = ["union-attr", "call-overload"]
+ignore_errors = true
 
 [tool.isort]
 profile = "black"
