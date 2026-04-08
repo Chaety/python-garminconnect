@@ -76,13 +76,11 @@ jobs:
           # 최신 CSV 미리보기
           (ls -t *.csv 2>/dev/null | head -n 1 | xargs -I{} sh -c 'echo ">>> {}"; head -n 5 "{}"') || true
 
-      # ── 토큰 복원: run_id 없는 키로 restore, 있는 키로 save → 항상 최신 토큰 유지 ──
       - name: Restore Garmin token cache (~/.garminconnect)
         id: restore_token
         uses: actions/cache/restore@v4
         with:
           path: ~/.garminconnect
-          # 정확한 키 먼저, 없으면 prefix로 가장 최신 것 복원
           key: garmin-token-v2-${{ github.run_id }}
           restore-keys: |
             garmin-token-v2-
@@ -93,9 +91,8 @@ jobs:
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           # DRY_RUN: "1"   # 필요 시 테스트 모드
         run: |
-          python garmin_weight_uploader.py
+          python GWU.py
 
-      # ── 토큰 저장: 성공/실패 무관하게 항상 저장 (갱신된 토큰 보존) ──
       - name: Save Garmin token cache
         if: always()
         uses: actions/cache/save@v4
