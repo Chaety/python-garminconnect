@@ -42,6 +42,10 @@ python_version = "3.10"
 disallow_untyped_defs = true
 warn_unused_ignores = true
 
+[[tool.mypy.overrides]]
+module = "garminconnect"
+disable_error_codes = ["union-attr", "call-overload"]
+
 [tool.isort]
 profile = "black"
 line_length = 88
