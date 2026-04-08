@@ -97,6 +97,7 @@ exclude = [
     ".pytest_cache",
     "build",
     "dist",
+    "GWU.py",           # 백업용 스크립트 - ruff 검사 제외
 ]
 
 [tool.ruff.lint]
