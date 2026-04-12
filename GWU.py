@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-garmin_weight_uploader.py
+GWU.py (Garmin Weight Uploader)
 
 - Google Fit CSV 전체를 읽어 Garmin Connect에 업로드
-- 시간 처리: CSV는 KST(+09:00)로 해석, 업로드는 UTC(Z)로 전송 → Garmin에서 현지시간으로 올바르게 표시
+- 시간 처리: CSV는 KST(+09:00)로 해석, 업로드는 UTC(Z)로 전송
 - 중복 제거: (날짜+시간+체중) 기준 (표시는 KST 기준)
 - BMI 자동 계산 (신장 174.8cm 고정)
 - '골격근량'이 있으면 muscle_mass로 우선 반영, 없으면 '근육량' 사용
+- 로그인: oauth1 토큰으로 oauth2만 갱신 (SSO 미사용 → 429 방지)
 """
 
 import argparse
@@ -20,6 +21,7 @@ from datetime import datetime
 import pandas as pd
 from dateutil import parser as dtparser
 from garminconnect import Garmin
+from garth import Client
 from zoneinfo import ZoneInfo
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -27,11 +29,9 @@ from zoneinfo import ZoneInfo
 # ──────────────────────────────────────────────────────────────────────────────
 TOKEN_DIR = os.path.expanduser("~/.garminconnect")
 
-# 사용자 신장 (m)
 USER_HEIGHT_M = 1.748
-USER_HEIGHT_M2 = USER_HEIGHT_M ** 2  # BMI 계산에 사용
+USER_HEIGHT_M2 = USER_HEIGHT_M ** 2
 
-# CSV 헤더 매핑 (한글 → 내부 표준 키)
 HEADER_MAP = {
     "날짜": "date",
     "시간": "time",
@@ -39,21 +39,19 @@ HEADER_MAP = {
     "체지방률": "percent_fat",
     "총 체수분": "percent_hydration",
     "골량": "bone_mass",
-    # 근육 관련: 두 가지가 들어올 수 있으니 모두 받는다
-    "근육량": "muscle_mass",            # 일반 근육량
+    "근육량": "muscle_mass",
     "근육량 비율": "percent_muscle",
-    "골격근량": "skeletal_muscle_mass", # 골격근량(있으면 우선 사용)
+    "골격근량": "skeletal_muscle_mass",
     "골격근 비율": "percent_skeletal_muscle",
     "기본 대사율": "basal_met",
     "BMI": "bmi",
 }
 
-# API로 보낼 때 사용할 수 있는 바디 컴포지션 항목 키(None은 미전송)
 BODY_FIELDS = (
     "percent_fat",
     "percent_hydration",
     "bone_mass",
-    "muscle_mass",     # ← 최종적으로 여기에 '골격근량' 또는 '근육량'을 매핑해 보냄
+    "muscle_mass",
     "basal_met",
     "bmi",
 )
@@ -61,23 +59,20 @@ BODY_FIELDS = (
 
 @dataclass
 class BodyRow:
-    ts_iso_utc: str           # 업로드용(UTC, '...Z')
-    date_str_kst: str         # 중복키/표시용(KST)
-    time_str_kst: str         # 중복키/표시용(KST)
+    ts_iso_utc: str
+    date_str_kst: str
+    time_str_kst: str
     weight: float
     percent_fat: float | None = None
     percent_hydration: float | None = None
     bone_mass: float | None = None
-    muscle_mass: float | None = None  # API가 받는 muscle_mass 최종값
+    muscle_mass: float | None = None
     basal_met: float | None = None
     bmi: float | None = None
-
-    # 원본 보존용(로그 확인용)
-    src_muscle_mass: float | None = None             # 근육량
-    src_skeletal_muscle_mass: float | None = None    # 골격근량
+    src_muscle_mass: float | None = None
+    src_skeletal_muscle_mass: float | None = None
 
     def dup_key(self) -> tuple[str, str, float]:
-        # KST 표시 기준으로 중복 제거
         return (self.date_str_kst, self.time_str_kst, round(self.weight, 2))
 
 
@@ -97,14 +92,9 @@ def _coerce_float(x) -> float | None:
 
 
 def _parse_timestamp_kst(date_str: str, time_str: str | None) -> datetime:
-    """
-    'YYYY.MM.DD HH:MM:SS' 또는 유사 포맷을 Asia/Seoul 기준 aware datetime으로.
-    CSV가 로컬시각(KST)라 가정하고 tzinfo 미지정 시 KST 부여.
-    """
     s = date_str.strip()
     if time_str and " " not in s and "T" not in s:
         s = f"{s} {time_str.strip()}"
-    # '2025.09.19' → '2025-09-19'
     s = s.replace(".", "-")
     dt = dtparser.parse(s)
     if dt.tzinfo is None:
@@ -113,21 +103,12 @@ def _parse_timestamp_kst(date_str: str, time_str: str | None) -> datetime:
 
 
 def _format_kst_for_display(dt_kst: datetime) -> tuple[str, str]:
-    """
-    KST 시간으로 Garmin UI와 유사 포맷:
-      - date:  MM/DD/YYYY
-      - time:  h:mm am/pm (소문자)
-    """
     date_s = dt_kst.strftime("%m/%d/%Y")
     time_s = dt_kst.strftime("%I:%M %p").lower().lstrip("0")
     return date_s, time_s
 
 
 def _to_utc_iso_z(dt_kst: datetime) -> str:
-    """
-    KST aware datetime → UTC로 변환 → 'YYYY-MM-DDTHH:MM:SSZ' 문자열.
-    (Garmin이 UTC로 저장 후 로컬로 보여주도록 보장)
-    """
     dt_utc = dt_kst.astimezone(ZoneInfo("UTC"))
     iso = dt_utc.isoformat()
     if iso.endswith("+00:00"):
@@ -187,15 +168,12 @@ def load_rows_from_csv(path: str) -> list[BodyRow]:
 def _rename_headers(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     for c in df.columns:
-        if c in HEADER_MAP:
-            new_cols[c] = HEADER_MAP[c]
-        else:
-            new_cols[c] = c.lower()
+        new_cols[c] = HEADER_MAP[c] if c in HEADER_MAP else c.lower()
     return df.rename(columns=new_cols)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Garmin 로그인 & 업로드
+# Garmin 로그인
 # ──────────────────────────────────────────────────────────────────────────────
 def login(email: str | None, password: str | None) -> Garmin:
     email = email or os.getenv("GARMIN_EMAIL")
@@ -203,20 +181,25 @@ def login(email: str | None, password: str | None) -> Garmin:
     if not email or not password:
         sys.exit("GARMIN_EMAIL / GARMIN_PASSWORD 필요")
 
-    api = Garmin(email, password)
     os.makedirs(TOKEN_DIR, exist_ok=True)
 
-    # 1) 저장된 토큰으로 복원 시도 (로그인 스킵 → 429 방지 핵심)
+    # 1) oauth1 토큰으로 oauth2만 갱신 (SSO 미사용 → 429 방지)
     try:
-        api.garth.load(TOKEN_DIR)
-        _ = api.display_name  # 토큰 유효성 확인 (만료 시 예외 발생)
-        print("✅ 토큰 재사용 성공 (로그인 스킵)")
+        c = Client()
+        c.load(TOKEN_DIR)
+        c.refresh_oauth2()          # oauth1으로 oauth2만 갱신, SSO 안 거침
+        c.dump(TOKEN_DIR)
+        print("✅ oauth2 갱신 성공 (SSO 로그인 스킵)")
+
+        api = Garmin(email, password)
+        api.garth = c
         return api
     except Exception as e:  # noqa: BLE001
-        print(f"ℹ️  저장된 토큰 없음 또는 만료 ({e}) → 새 로그인 시도")
+        print(f"ℹ️  토큰 갱신 실패 ({e}) → 새 로그인 시도")
 
-    # 2) 새 로그인 후 토큰 저장
+    # 2) 최초 1회 또는 oauth1 만료 시 전체 로그인
     try:
+        api = Garmin(email, password)
         api.login()
         api.garth.dump(TOKEN_DIR)
         print("✅ Garmin 새 로그인 성공 (토큰 저장됨)")
@@ -226,6 +209,9 @@ def login(email: str | None, password: str | None) -> Garmin:
     return api
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 업로드
+# ──────────────────────────────────────────────────────────────────────────────
 def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates: bool) -> None:
     seen: set[tuple[str, str, float]] = set()
 
@@ -237,11 +223,13 @@ def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates
         seen.add(k)
 
         mm_src = (
-            "골격근량" if (row.src_skeletal_muscle_mass is not None)
-            else ("근육량" if (row.src_muscle_mass is not None) else "없음")
+            "골격근량" if row.src_skeletal_muscle_mass is not None
+            else ("근육량" if row.src_muscle_mass is not None else "없음")
         )
-        print(f"➡️ {row.date_str_kst} {row.time_str_kst}  {row.weight}kg  "
-              f"(muscle_mass: {row.muscle_mass} [{mm_src}], BMI: {row.bmi}) 업로드 중... → {row.ts_iso_utc}")
+        print(
+            f"➡️ {row.date_str_kst} {row.time_str_kst}  {row.weight}kg  "
+            f"(muscle_mass: {row.muscle_mass} [{mm_src}], BMI: {row.bmi}) → {row.ts_iso_utc}"
+        )
 
         if dry_run:
             continue
@@ -252,7 +240,6 @@ def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates
                 v = getattr(row, f)
                 if v is not None:
                     payload[f] = v
-
             api.add_body_composition(row.ts_iso_utc, **payload)
             print("   ✅ 성공")
         except Exception as e:
@@ -268,9 +255,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--email")
     ap.add_argument("--password")
-    ap.add_argument("--csv", nargs="*", default=["무게*.csv"], help="CSV 패턴 (기본: 무게*.csv 전체)")
+    ap.add_argument("--csv", nargs="*", default=["무게*.csv"])
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--no-skip-duplicates", action="store_true", help="중복도 강제 업로드")
+    ap.add_argument("--no-skip-duplicates", action="store_true")
     args = ap.parse_args()
 
     targets: list[str] = []
@@ -287,11 +274,9 @@ def main():
 
     all_rows: list[BodyRow] = []
     for path in targets:
-        rows = load_rows_from_csv(path)
-        all_rows.extend(rows)
+        all_rows.extend(load_rows_from_csv(path))
 
     print(f"총 {len(all_rows)}개 레코드 로드됨")
-
     upload_rows(api, all_rows, args.dry_run, skip_duplicates=not args.no_skip_duplicates)
 
 
