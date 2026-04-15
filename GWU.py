@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 # ──────────────────────────────────────────────────────────────────────────────
 TOKEN_DIR = os.path.expanduser("~/.garminconnect")
 
-USER_HEIGHT_M = 1.748
+USER_HEIGHT_M = 1.751
 USER_HEIGHT_M2 = USER_HEIGHT_M ** 2
 
 HEADER_MAP = {
