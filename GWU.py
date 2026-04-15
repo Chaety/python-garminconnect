@@ -7,10 +7,7 @@ GWU.py (Garmin Weight Uploader)
 - 중복 제거: (날짜+시간+체중) 기준 (표시는 KST 기준)
 - BMI 자동 계산 (신장 174.8cm 고정)
 - '골격근량'이 있으면 muscle_mass로 우선 반영, 없으면 '근육량' 사용
-- 로그인 우선순위:
-    1) 저장된 토큰 복원 (garmin.login(tokenstore))
-    2) oauth1으로 oauth2만 갱신 (SSO 미사용 → 429 방지)
-    3) 최초/만료 시 MFA 지원 새 로그인
+- 로그인: garminconnect 0.3.2 방식 (저장된 토큰 복원 → 새 로그인)
 """
 
 import argparse
@@ -20,7 +17,6 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from getpass import getpass
 from pathlib import Path
 
 import pandas as pd
@@ -31,7 +27,6 @@ from garminconnect import (
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
 )
-from garth import Client
 from zoneinfo import ZoneInfo
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -183,7 +178,7 @@ def _rename_headers(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Garmin 로그인
+# Garmin 로그인 (garminconnect 0.3.2 방식)
 # ──────────────────────────────────────────────────────────────────────────────
 def login(email: str | None, password: str | None) -> Garmin:
     email = email or os.getenv("GARMIN_EMAIL")
@@ -191,7 +186,7 @@ def login(email: str | None, password: str | None) -> Garmin:
 
     Path(TOKEN_DIR).mkdir(parents=True, exist_ok=True)
 
-    # 1) 저장된 토큰으로 복원 시도 (example.py 방식)
+    # 1) 저장된 토큰으로 복원 시도
     try:
         api = Garmin()
         api.login(TOKEN_DIR)
@@ -199,44 +194,28 @@ def login(email: str | None, password: str | None) -> Garmin:
         return api
     except GarminConnectTooManyRequestsError as e:
         sys.exit(f"❌ Rate limit: {e}")
-    except (GarminConnectAuthenticationError, GarminConnectConnectionError, FileNotFoundError, Exception):
-        print("ℹ️  저장된 토큰 없음 또는 만료")
-
-    # 2) oauth1으로 oauth2만 갱신 (SSO 미사용 → 429 방지)
-    try:
-        c = Client()
-        c.load(TOKEN_DIR)
-        c.refresh_oauth2()
-        c.dump(TOKEN_DIR)
-        print("✅ oauth2 갱신 성공 (SSO 스킵)")
-        api = Garmin(email, password)
-        api.garth = c
-        return api
     except Exception as e:  # noqa: BLE001
-        print(f"ℹ️  oauth2 갱신 실패 ({e}) → 새 로그인 시도")
+        print(f"ℹ️  저장된 토큰 없음 또는 만료 ({e}) → 새 로그인 시도")
 
-    # 3) 최초 / oauth1 만료 시: MFA 지원 새 로그인
+    # 2) 새 로그인
     if not email or not password:
         sys.exit("❌ GARMIN_EMAIL / GARMIN_PASSWORD 필요")
 
-    while True:
-        try:
-            api = Garmin(
-                email=email,
-                password=password,
-                prompt_mfa=lambda: input("MFA 코드 입력: ").strip(),
-            )
-            api.login(TOKEN_DIR)
-            print(f"✅ 새 로그인 성공 (토큰 저장: {TOKEN_DIR})")
-            return api
-
-        except GarminConnectTooManyRequestsError as e:
-            sys.exit(f"❌ Rate limit: {e}")
-        except GarminConnectAuthenticationError:
-            print("❌ 이메일/비번 오류 — 환경변수 확인 후 재시도")
-            sys.exit(1)
-        except GarminConnectConnectionError as e:
-            sys.exit(f"❌ 연결 오류: {e}")
+    try:
+        api = Garmin(
+            email=email,
+            password=password,
+            prompt_mfa=lambda: input("MFA 코드 입력: ").strip(),
+        )
+        api.login(TOKEN_DIR)
+        print(f"✅ 새 로그인 성공 (토큰 저장: {TOKEN_DIR})")
+        return api
+    except GarminConnectTooManyRequestsError as e:
+        sys.exit(f"❌ Rate limit: {e}")
+    except GarminConnectAuthenticationError:
+        sys.exit("❌ 이메일/비번 오류 — 환경변수 확인")
+    except GarminConnectConnectionError as e:
+        sys.exit(f"❌ 연결 오류: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
