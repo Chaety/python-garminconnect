@@ -5,7 +5,7 @@ GWU.py (Garmin Weight Uploader)
 - Google Fit CSV 전체를 읽어 Garmin Connect에 업로드
 - 시간 처리: CSV는 KST(+09:00)로 해석, 업로드는 UTC(Z)로 전송
 - 중복 제거: (날짜+시간+체중) 기준 (표시는 KST 기준)
-- BMI 자동 계산 (신장 175.1cm 고정)
+- BMI 자동 계산 (신장 174.8cm 고정)
 - '골격근량'이 있으면 muscle_mass로 우선 반영, 없으면 '근육량' 사용
 - 로그인 우선순위:
     1) 저장된 토큰 복원 (garmin.login(tokenstore))
@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo
 # ──────────────────────────────────────────────────────────────────────────────
 TOKEN_DIR = str(Path("~/.garminconnect").expanduser())
 
-USER_HEIGHT_M = 1.751
+USER_HEIGHT_M = 1.748
 USER_HEIGHT_M2 = USER_HEIGHT_M ** 2
 
 HEADER_MAP = {
@@ -199,7 +199,7 @@ def login(email: str | None, password: str | None) -> Garmin:
         return api
     except GarminConnectTooManyRequestsError as e:
         sys.exit(f"❌ Rate limit: {e}")
-    except (GarminConnectAuthenticationError, GarminConnectConnectionError):
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError, FileNotFoundError, Exception):
         print("ℹ️  저장된 토큰 없음 또는 만료")
 
     # 2) oauth1으로 oauth2만 갱신 (SSO 미사용 → 429 방지)
