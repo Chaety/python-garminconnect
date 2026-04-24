@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install garth
-          pip install git+https://github.com/cyberjunky/python-garminconnect.git readchar
+          pip install garminconnect==0.3.2 readchar
           python - <<'PY'
           from importlib.metadata import version, PackageNotFoundError
           for p in ["garminconnect","garth","pandas","python-dateutil"]:
