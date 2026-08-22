@@ -145,3 +145,7 @@ dmypy.json
 
 # Ignore folder for local testing
 ignore/
+
+# 로컬에서 생성한 가민 토큰 시크릿 값 (절대 커밋 금지)
+garmin_token.b64
+garmin_token.zip
