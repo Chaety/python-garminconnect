@@ -23,11 +23,24 @@ jobs:
       # 공개 저장소는 60일간 커밋이 없으면 GitHub가 schedule 트리거를 자동 비활성화한다.
       # (실제로 2026-04-24 마지막 커밋 → 2026-06-23 이후 실행 중단됨)
       # 45일 이상 활동이 없으면 빈 커밋을 남겨 비활성화 카운터를 리셋한다.
+      # 이 저장소는 서드파티 액션이 차단돼 있어 외부 액션 대신 직접 구현한다.
       - name: Keepalive (prevent schedule auto-disable)
-        uses: gautamkrishnar/keepalive-workflow@v2
-        with:
-          time_elapsed: "45"
-          commit_message: "chore: keepalive to prevent scheduled workflow auto-disable"
+        env:
+          THRESHOLD_DAYS: "45"
+        run: |
+          set -euo pipefail
+          last_commit=$(git log -1 --format=%ct)
+          elapsed_days=$(( ( $(date +%s) - last_commit ) / 86400 ))
+          echo "마지막 커밋 이후 ${elapsed_days}일 경과 (임계값: ${THRESHOLD_DAYS}일)"
+          if [ "$elapsed_days" -lt "$THRESHOLD_DAYS" ]; then
+            echo "아직 keepalive 불필요"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive to prevent scheduled workflow auto-disable"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "keepalive 커밋 푸시 완료"
 
       - name: Set up Python
         uses: actions/setup-python@v5
