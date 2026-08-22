@@ -12,9 +12,22 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    # keepalive 스텝이 커밋을 푸시하려면 쓰기 권한 필요
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 공개 저장소는 60일간 커밋이 없으면 GitHub가 schedule 트리거를 자동 비활성화한다.
+      # (실제로 2026-04-24 마지막 커밋 → 2026-06-23 이후 실행 중단됨)
+      # 45일 이상 활동이 없으면 빈 커밋을 남겨 비활성화 카운터를 리셋한다.
+      - name: Keepalive (prevent schedule auto-disable)
+        uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          time_elapsed: "45"
+          commit_message: "chore: keepalive to prevent scheduled workflow auto-disable"
 
       - name: Set up Python
         uses: actions/setup-python@v5
