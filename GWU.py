@@ -221,16 +221,42 @@ def login(email: str | None, password: str | None) -> Garmin:
 # ──────────────────────────────────────────────────────────────────────────────
 # 업로드
 # ──────────────────────────────────────────────────────────────────────────────
-def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates: bool) -> None:
-    seen: set[tuple[str, str, float]] = set()
+def _field_score(row: BodyRow) -> int:
+    """채워진 체성분 필드 수."""
+    return sum(1 for f in BODY_FIELDS if getattr(row, f) is not None)
+
+
+def dedupe_rows(rows: list[BodyRow]) -> list[BodyRow]:
+    """같은 측정(날짜+시간+체중) 중 체성분 필드가 가장 많이 채워진 레코드만 남긴다.
+
+    같은 측정이 삼성헬스와 Health Connect 양쪽 CSV에 들어있는데, HC 쪽은
+    골격근량·골량이 0(→ None)인 경우가 많다. 예전에는 먼저 만난 행을 채택했고
+    파일 순서가 glob 결과(파일시스템 순서)라, 어느 쪽이 이길지가 실행마다 달라져
+    골격근량이 무작위로 유실됐다. 순서 대신 내용으로 고른다.
+    """
+    best: dict[tuple[str, str, float], BodyRow] = {}
+    order: list[tuple[str, str, float]] = []
 
     for row in rows:
         k = row.dup_key()
-        if skip_duplicates and k in seen:
-            print(f"⏭️  {row.date_str_kst} {row.time_str_kst} {row.weight}kg → 중복 스킵")
-            continue
-        seen.add(k)
+        if k not in best:
+            best[k] = row
+            order.append(k)
+        elif _field_score(row) > _field_score(best[k]):
+            best[k] = row
 
+    return [best[k] for k in order]
+
+
+def upload_rows(api: Garmin, rows: list[BodyRow], dry_run: bool, skip_duplicates: bool) -> None:
+    if skip_duplicates:
+        deduped = dedupe_rows(rows)
+        dropped = len(rows) - len(deduped)
+        if dropped:
+            print(f"⏭️  중복 {dropped}건 제외 (측정별로 값이 가장 많이 채워진 레코드 채택)")
+        rows = deduped
+
+    for row in rows:
         mm_src = (
             "골격근량" if row.src_skeletal_muscle_mass is not None
             else ("근육량" if row.src_muscle_mass is not None else "없음")
