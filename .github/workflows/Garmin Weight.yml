@@ -2,6 +2,15 @@ name: Garmin Weight Uploader (Drive → Garmin)
 
 on:
   workflow_dispatch:
+    inputs:
+      max_age:
+        description: "Drive에서 받아올 파일의 최대 나이 (rclone --max-age). 전체 재동기화는 all"
+        required: false
+        default: "30d"
+      since_days:
+        description: "이 일수보다 오래된 측정은 업로드 생략. 전체 재동기화는 all"
+        required: false
+        default: "30"
   schedule:
     # 매일 오전 0시 (KST)
     - cron: "0 15 * * *"
@@ -95,9 +104,23 @@ jobs:
       - name: Download CSVs from Drive (export Sheets→CSV)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          # 스케줄 실행은 30d 를, 수동 실행은 입력값을 쓴다. all 이면 필터를 꺼
+          # 전체 폴더를 받는다 (백필용). 빈 문자열은 GitHub 표현식에서 falsy 라
+          # 기본값으로 떨어지므로, 해제는 빈칸이 아니라 all 로 지정한다.
+          MAX_AGE: ${{ github.event_name == 'workflow_dispatch' && inputs.max_age || '30d' }}
         run: |
           set -e
-          rclone copy 'gdrive:' . --drive-export-formats csv
+          # GWU.py 는 .csv 만 읽는데 폴더에는 측정마다 .fit 이 함께 있어 파일 수가
+          # 두 배다. 받아봐야 쓰지 않으므로 제외한다.
+          # --max-age 는 폴더 전체(2024년부터 누적)를 매번 내려받지 않게 한다.
+          FILTERS=(--include '*.csv')
+          if [ -n "$MAX_AGE" ] && [ "$MAX_AGE" != "all" ]; then
+            FILTERS+=(--max-age "$MAX_AGE")
+            echo "최근 ${MAX_AGE} 이내 CSV 만 내려받습니다."
+          else
+            echo "나이 필터 없음 — 전체 CSV 를 내려받습니다."
+          fi
+          rclone copy 'gdrive:' . --drive-export-formats csv "${FILTERS[@]}"
           echo "Workspace files:"; ls -al
           echo "CSV files:"; ls -al *.csv || true
           (ls -t *.csv 2>/dev/null | head -n 1 | xargs -I{} sh -c 'echo ">>> {}"; head -n 5 "{}"') || true
@@ -125,10 +148,17 @@ jobs:
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          SINCE_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.since_days || '30' }}
         run: |
           # 로컬 garminconnect 폴더가 pip 설치 버전보다 우선되는 문제 방지
           mv garminconnect garminconnect_local_bak
-          python GWU.py
+          # 이미 가민에 있는 과거 기록까지 매번 재전송하면 레코드당 0.3초씩
+          # 쌓여 실행이 길어지고 가민 API 도 그만큼 두드리게 된다.
+          ARGS=()
+          if [ -n "$SINCE_DAYS" ] && [ "$SINCE_DAYS" != "all" ]; then
+            ARGS+=(--since-days "$SINCE_DAYS")
+          fi
+          python GWU.py "${ARGS[@]}"
           mv garminconnect_local_bak garminconnect
 
       - name: Save Garmin token cache
