@@ -16,7 +16,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -221,6 +221,28 @@ def login(email: str | None, password: str | None) -> Garmin:
 # ──────────────────────────────────────────────────────────────────────────────
 # 업로드
 # ──────────────────────────────────────────────────────────────────────────────
+def filter_since(rows: list[BodyRow], since_days: int | None) -> list[BodyRow]:
+    """``since_days``일보다 오래된 측정을 제외한다. None이면 전부 통과.
+
+    가민은 같은 타임스탬프로 다시 올리면 덮어쓰기 때문에, 매 실행마다 전체
+    이력을 재전송해도 결과는 같다. 다만 레코드마다 API 호출 + 0.3초 대기가
+    붙어서 수백 건이면 몇 분이 걸리고, 그 대부분은 이미 가민에 있는 값이다.
+    새로 들어온 것만 보내면 실행 시간도 가민 API 부담도 같이 줄어든다.
+    """
+    if since_days is None:
+        return rows
+
+    cutoff = datetime.now(ZoneInfo("UTC")) - timedelta(days=since_days)
+    kept = [
+        r for r in rows
+        if datetime.fromisoformat(r.ts_iso_utc.replace("Z", "+00:00")) >= cutoff
+    ]
+    dropped = len(rows) - len(kept)
+    if dropped:
+        print(f"⏭️  {since_days}일 이전 {dropped}건 제외 (이미 반영된 기록)")
+    return kept
+
+
 def _field_score(row: BodyRow) -> int:
     """채워진 체성분 필드 수."""
     return sum(1 for f in BODY_FIELDS if getattr(row, f) is not None)
@@ -293,6 +315,12 @@ def main():
     ap.add_argument("--csv", nargs="*", default=["무게*.csv"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-skip-duplicates", action="store_true")
+    ap.add_argument(
+        "--since-days",
+        type=int,
+        default=None,
+        help="이 일수보다 오래된 측정은 건너뛴다 (생략하면 전체 처리)",
+    )
     args = ap.parse_args()
 
     targets: list[str] = []
@@ -312,6 +340,7 @@ def main():
         all_rows.extend(load_rows_from_csv(path))
 
     print(f"총 {len(all_rows)}개 레코드 로드됨")
+    all_rows = filter_since(all_rows, args.since_days)
     upload_rows(api, all_rows, args.dry_run, skip_duplicates=not args.no_skip_duplicates)
 
 
